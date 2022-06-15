@@ -1,5 +1,14 @@
 name: CI
-on: [push, pull_request]
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
 jobs:
   test:
     strategy:
@@ -14,19 +23,19 @@ jobs:
             needs-python: ${{ true }}
             needs-node: ${{ false }}
           - name: Documentation
-            command: make docs BINDIR="$(dirname $(which python))"
+            command: bin/docs
             needs-python: ${{ true }}
             needs-node: ${{ false }}
           - name: Dependencies
-            command: make github-actions-deps BINDIR="$(dirname $(which python))"
+            command: bin/github-actions-deps
             needs-python: ${{ true }}
             needs-node: ${{ false }}
           - name: Licenses
-            command: make licenses BINDIR="$(dirname $(which python))"
+            command: bin/licenses
             needs-python: ${{ true }}
             needs-node: ${{ false }}
           - name: Translations
-            command: make translations BINDIR="$(dirname $(which python))"
+            command: bin/translations
             needs-python: ${{ true }}
             needs-node: ${{ false }}
           - name: Static Tests
@@ -50,18 +59,18 @@ jobs:
     name: ${{ matrix.name }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
       - name: Install platform dependencies
         run: |
           sudo apt -y update
           sudo apt -y install libcurl4-openssl-dev libssl-dev pkg-config
-      - uses: actions/setup-python@v2
+      - uses: actions/setup-python@v4
         if: ${{ matrix.needs-python }}
         with:
-          python-version: 3.8.2
+          python-version-file: '.python-version'
       - name: Cache Python dependencies
         if: ${{ matrix.needs-python }}
-        uses: actions/cache@v2
+        uses: actions/cache@v3
         env:
           cache-name: warehouse-cache-pip
         with:
@@ -75,12 +84,12 @@ jobs:
         if: ${{ matrix.needs-python }}
         run: |
           pip install -U pip setuptools wheel
-          pip install -r requirements.txt
+          pip install -r requirements.txt --no-deps
           pip install -r requirements/dev.txt
-      - uses: actions/setup-node@v2
+      - uses: actions/setup-node@v3
         if: ${{ matrix.needs-node }}
         with:
-          node-version: 14.4.0
+          node-version: 14.15.5
       - name: Cache Node dependencies
         if: ${{ matrix.needs-node }}
         uses: actions/cache@v2

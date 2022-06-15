@@ -10,16 +10,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections import OrderedDict
-
 import pretend
 
 from pyramid.httpexceptions import HTTPMovedPermanently, HTTPNotFound
 
 from warehouse.legacy.api import json
-from warehouse.packaging.models import Dependency, DependencyKind
+from warehouse.packaging.models import ReleaseURL
 
 from ....common.db.accounts import UserFactory
+from ....common.db.integrations import VulnerabilityRecordFactory
 from ....common.db.packaging import (
     DescriptionFactory,
     FileFactory,
@@ -45,7 +44,7 @@ class TestJSONProject:
         project = ProjectFactory.create()
 
         name = project.name.lower()
-        if name == project.name:
+        if name == project.normalized_name:
             name = project.name.upper()
 
         db_request.matchdict = {"name": name}
@@ -58,7 +57,9 @@ class TestJSONProject:
         assert isinstance(resp, HTTPMovedPermanently)
         assert resp.headers["Location"] == "/project/the-redirect/"
         _assert_has_cors_headers(resp.headers)
-        assert db_request.current_route_path.calls == [pretend.call(name=project.name)]
+        assert db_request.current_route_path.calls == [
+            pretend.call(name=project.normalized_name)
+        ]
 
     def test_missing_release(self, db_request):
         project = ProjectFactory.create()
@@ -193,17 +194,23 @@ class TestJSONProjectSlash:
     def test_normalizing_redirects(self, db_request):
         project = ProjectFactory.create()
 
-        db_request.route_path = pretend.call_recorder(
-            lambda *a, **kw: "/project/the-redirect"
+        name = project.name.lower()
+        if name == project.normalized_name:
+            name = project.name.upper()
+
+        db_request.matchdict = {"name": name}
+        db_request.current_route_path = pretend.call_recorder(
+            lambda name: "/project/the-redirect/"
         )
 
         resp = json.json_project_slash(project, db_request)
 
         assert isinstance(resp, HTTPMovedPermanently)
-        assert db_request.route_path.calls == [
-            pretend.call("legacy.api.json.project", name=project.name)
+        assert resp.headers["Location"] == "/project/the-redirect/"
+        _assert_has_cors_headers(resp.headers)
+        assert db_request.current_route_path.calls == [
+            pretend.call(name=project.normalized_name)
         ]
-        assert resp.headers["Location"] == "/project/the-redirect"
 
 
 class TestJSONRelease:
@@ -212,7 +219,7 @@ class TestJSONRelease:
         release = ReleaseFactory.create(project=project, version="3.0")
 
         name = release.project.name.lower()
-        if name == release.project.name:
+        if name == release.project.normalized_name:
             name = release.project.name.upper()
 
         db_request.matchdict = {"name": name}
@@ -226,7 +233,7 @@ class TestJSONRelease:
         assert resp.headers["Location"] == "/project/the-redirect/3.0/"
         _assert_has_cors_headers(resp.headers)
         assert db_request.current_route_path.calls == [
-            pretend.call(name=release.project.name)
+            pretend.call(name=release.project.normalized_name)
         ]
 
     def test_detail_renders(self, pyramid_config, db_request, db_session):
@@ -246,9 +253,11 @@ class TestJSONRelease:
             r"unsafechars,http://example.com <>[]{}|\^%",
         ]
         expected_urls = []
-        for project_url in reversed(project_urls):
-            expected_urls.append(tuple(project_url.split(",")))
-        expected_urls = OrderedDict(tuple(expected_urls))
+        for project_url in sorted(
+            project_urls, key=lambda u: u.split(",", 1)[0].strip().lower()
+        ):
+            expected_urls.append(tuple(project_url.split(",", 1)))
+        expected_urls = dict(tuple(expected_urls))
 
         releases = [
             ReleaseFactory.create(project=project, version=v)
@@ -265,11 +274,12 @@ class TestJSONRelease:
         ]
 
         for urlspec in project_urls:
+            label, _, purl = urlspec.partition(",")
             db_session.add(
-                Dependency(
+                ReleaseURL(
                     release=releases[3],
-                    kind=DependencyKind.project_url.value,
-                    specifier=urlspec,
+                    name=label.strip(),
+                    url=purl.strip(),
                 )
             )
 
@@ -432,6 +442,7 @@ class TestJSONRelease:
                 }
             ],
             "last_serial": je.id,
+            "vulnerabilities": [],
         }
 
     def test_minimal_renders(self, pyramid_config, db_request):
@@ -538,25 +549,58 @@ class TestJSONRelease:
                 }
             ],
             "last_serial": je.id,
+            "vulnerabilities": [],
         }
+
+    def test_vulnerabilities_renders(self, pyramid_config, db_request):
+        project = ProjectFactory.create(has_docs=False)
+        release = ReleaseFactory.create(project=project, version="0.1")
+        VulnerabilityRecordFactory.create(
+            id="PYSEC-001",
+            source="the source",
+            link="the link",
+            aliases=["alias1", "alias2"],
+            details="some details",
+            fixed_in=["3.3.2"],
+            releases=[release],
+        )
+
+        url = "/the/fake/url/"
+        db_request.route_url = pretend.call_recorder(lambda *args, **kw: url)
+
+        result = json.json_release(release, db_request)
+
+        assert result["vulnerabilities"] == [
+            {
+                "id": "PYSEC-001",
+                "source": "the source",
+                "link": "the link",
+                "aliases": ["alias1", "alias2"],
+                "details": "some details",
+                "fixed_in": ["3.3.2"],
+            },
+        ]
 
 
 class TestJSONReleaseSlash:
     def test_normalizing_redirects(self, db_request):
-        release = ReleaseFactory.create()
+        project = ProjectFactory.create()
+        release = ReleaseFactory.create(project=project, version="3.0")
 
-        db_request.route_path = pretend.call_recorder(
-            lambda *a, **kw: "/project/the-redirect"
+        name = release.project.name.lower()
+        if name == release.project.normalized_name:
+            name = release.project.name.upper()
+
+        db_request.matchdict = {"name": name}
+        db_request.current_route_path = pretend.call_recorder(
+            lambda name: "/project/the-redirect/3.0/"
         )
 
         resp = json.json_release_slash(release, db_request)
 
         assert isinstance(resp, HTTPMovedPermanently)
-        assert db_request.route_path.calls == [
-            pretend.call(
-                "legacy.api.json.release",
-                name=release.project.name,
-                version=release.version,
-            )
+        assert resp.headers["Location"] == "/project/the-redirect/3.0/"
+        _assert_has_cors_headers(resp.headers)
+        assert db_request.current_route_path.calls == [
+            pretend.call(name=release.project.normalized_name)
         ]
-        assert resp.headers["Location"] == "/project/the-redirect"

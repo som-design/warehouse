@@ -179,11 +179,21 @@ def test_routes(warehouse):
             "accounts.verify-email", "/account/verify-email/", domain=warehouse
         ),
         pretend.call(
+            "accounts.verify-organization-role",
+            "/account/verify-organization-role/",
+            domain=warehouse,
+        ),
+        pretend.call(
             "accounts.verify-project-role",
             "/account/verify-project-role/",
             domain=warehouse,
         ),
         pretend.call("manage.account", "/manage/account/", domain=warehouse),
+        pretend.call(
+            "manage.account.two-factor",
+            "/manage/account/two-factor/",
+            domain=warehouse,
+        ),
         pretend.call(
             "manage.account.totp-provision",
             "/manage/account/totp-provision",
@@ -225,12 +235,62 @@ def test_routes(warehouse):
             domain=warehouse,
         ),
         pretend.call(
+            "manage.account.recovery-codes.burn",
+            "/manage/account/recovery-codes/burn",
+            domain=warehouse,
+        ),
+        pretend.call(
             "manage.account.token", "/manage/account/token/", domain=warehouse
+        ),
+        pretend.call(
+            "manage.organizations", "/manage/organizations/", domain=warehouse
+        ),
+        pretend.call(
+            "manage.organization.settings",
+            "/manage/organization/{organization_name}/settings/",
+            factory="warehouse.organizations.models:OrganizationFactory",
+            traverse="/{organization_name}",
+            domain=warehouse,
+        ),
+        pretend.call(
+            "manage.organization.roles",
+            "/manage/organization/{organization_name}/people/",
+            factory="warehouse.organizations.models:OrganizationFactory",
+            traverse="/{organization_name}",
+            domain=warehouse,
+        ),
+        pretend.call(
+            "manage.organization.revoke_invite",
+            "/manage/organization/{organization_name}/people/revoke_invite/",
+            factory="warehouse.organizations.models:OrganizationFactory",
+            traverse="/{organization_name}",
+            domain=warehouse,
+        ),
+        pretend.call(
+            "manage.organization.change_role",
+            "/manage/organization/{organization_name}/people/change/",
+            factory="warehouse.organizations.models:OrganizationFactory",
+            traverse="/{organization_name}",
+            domain=warehouse,
+        ),
+        pretend.call(
+            "manage.organization.delete_role",
+            "/manage/organization/{organization_name}/people/delete/",
+            factory="warehouse.organizations.models:OrganizationFactory",
+            traverse="/{organization_name}",
+            domain=warehouse,
         ),
         pretend.call("manage.projects", "/manage/projects/", domain=warehouse),
         pretend.call(
             "manage.project.settings",
             "/manage/project/{project_name}/settings/",
+            factory="warehouse.packaging.models:ProjectFactory",
+            traverse="/{project_name}",
+            domain=warehouse,
+        ),
+        pretend.call(
+            "manage.project.settings.publishing",
+            "/manage/project/{project_name}/settings/publishing/",
             factory="warehouse.packaging.models:ProjectFactory",
             traverse="/{project_name}",
             domain=warehouse,
@@ -411,13 +471,14 @@ def test_routes(warehouse):
         pretend.call(
             "sponsors",
             "/sponsors/",
-            "warehouse:templates/pages/sponsors.html",
+            "pages/sponsors.html",
             view_kw={"has_translations": True},
         ),
     ]
 
     assert config.add_redirect.calls == [
         pretend.call("/sponsor/", "/sponsors/", domain=warehouse),
+        pretend.call("/u/{username}/", "/user/{username}/", domain=warehouse),
         pretend.call("/p/{name}/", "/project/{name}/", domain=warehouse),
         pretend.call("/pypi/{name}/", "/project/{name}/", domain=warehouse),
         pretend.call(

@@ -25,18 +25,21 @@ from sqlalchemy import (
     Integer,
     LargeBinary,
     String,
+    Text,
     UniqueConstraint,
     orm,
     select,
     sql,
 )
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm.exc import NoResultFound
 
 from warehouse import db
+from warehouse.events.models import HasEvents
 from warehouse.sitemap.models import SitemapMixin
 from warehouse.utils.attrs import make_repr
+from warehouse.utils.db.types import TZDateTime
 
 
 class UserFactory:
@@ -53,9 +56,10 @@ class UserFactory:
 class DisableReason(enum.Enum):
 
     CompromisedPassword = "password compromised"
+    AccountFrozen = "account frozen"
 
 
-class User(SitemapMixin, db.Model):
+class User(SitemapMixin, HasEvents, db.Model):
 
     __tablename__ = "users"
     __table_args__ = (
@@ -71,8 +75,9 @@ class User(SitemapMixin, db.Model):
     username = Column(CIText, nullable=False, unique=True)
     name = Column(String(length=100), nullable=False)
     password = Column(String(length=128), nullable=False)
-    password_date = Column(DateTime, nullable=True, server_default=sql.func.now())
+    password_date = Column(TZDateTime, nullable=True, server_default=sql.func.now())
     is_active = Column(Boolean, nullable=False, server_default=sql.false())
+    is_frozen = Column(Boolean, nullable=False, server_default=sql.false())
     is_superuser = Column(Boolean, nullable=False, server_default=sql.false())
     is_moderator = Column(Boolean, nullable=False, server_default=sql.false())
     is_psf_staff = Column(Boolean, nullable=False, server_default=sql.false())
@@ -80,7 +85,7 @@ class User(SitemapMixin, db.Model):
         Boolean, nullable=False, server_default=sql.false()
     )
     date_joined = Column(DateTime, server_default=sql.func.now())
-    last_login = Column(DateTime, nullable=False, server_default=sql.func.now())
+    last_login = Column(TZDateTime, nullable=False, server_default=sql.func.now())
     disabled_for = Column(
         Enum(DisableReason, values_callable=lambda x: [e.value for e in x]),
         nullable=True,
@@ -104,20 +109,6 @@ class User(SitemapMixin, db.Model):
         "Macaroon", backref="user", cascade="all, delete-orphan", lazy=True
     )
 
-    events = orm.relationship(
-        "UserEvent", backref="user", cascade="all, delete-orphan", lazy=True
-    )
-
-    def record_event(self, *, tag, ip_address, additional):
-        session = orm.object_session(self)
-        event = UserEvent(
-            user=self, tag=tag, ip_address=ip_address, additional=additional
-        )
-        session.add(event)
-        session.flush()
-
-        return event
-
     @property
     def primary_email(self):
         primaries = [x for x in self.emails if x.primary]
@@ -135,12 +126,12 @@ class User(SitemapMixin, db.Model):
         primary_email = self.primary_email
         return primary_email.email if primary_email else None
 
-    @email.expression
+    @email.expression  # type: ignore
     def email(self):
         return (
             select([Email.email])
             .where((Email.user_id == self.id) & (Email.primary.is_(True)))
-            .as_scalar()
+            .scalar_subquery()
         )
 
     @property
@@ -149,7 +140,11 @@ class User(SitemapMixin, db.Model):
 
     @property
     def has_recovery_codes(self):
-        return len(self.recovery_codes) > 0
+        return any(not code.burned for code in self.recovery_codes)
+
+    @property
+    def has_burned_recovery_codes(self):
+        return any(code.burned for code in self.recovery_codes)
 
     @property
     def has_primary_verified_email(self):
@@ -160,10 +155,11 @@ class User(SitemapMixin, db.Model):
         session = orm.object_session(self)
         last_ninety = datetime.datetime.now() - datetime.timedelta(days=90)
         return (
-            session.query(UserEvent)
-            .filter((UserEvent.user_id == self.id) & (UserEvent.time >= last_ninety))
-            .order_by(UserEvent.time.desc())
-            .all()
+            session.query(User.Event)
+            .filter(
+                (User.Event.source_id == self.id) & (User.Event.time >= last_ninety)
+            )
+            .order_by(User.Event.time.desc())
         )
 
     @property
@@ -188,6 +184,7 @@ class WebAuthn(db.Model):
         UUID(as_uuid=True),
         ForeignKey("users.id", deferrable=True, initially="DEFERRED"),
         nullable=False,
+        index=True,
     )
     label = Column(String, nullable=False)
     credential_id = Column(String, unique=True, nullable=False)
@@ -202,23 +199,11 @@ class RecoveryCode(db.Model):
         UUID(as_uuid=True),
         ForeignKey("users.id", deferrable=True, initially="DEFERRED"),
         nullable=False,
+        index=True,
     )
     code = Column(String(length=128), nullable=False)
     generated = Column(DateTime, nullable=False, server_default=sql.func.now())
-
-
-class UserEvent(db.Model):
-    __tablename__ = "user_events"
-
-    user_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("users.id", deferrable=True, initially="DEFERRED"),
-        nullable=False,
-    )
-    tag = Column(String, nullable=False)
-    time = Column(DateTime, nullable=False, server_default=sql.func.now())
-    ip_address = Column(String, nullable=False)
-    additional = Column(JSONB, nullable=True)
+    burned = Column(DateTime, nullable=True)
 
 
 class UnverifyReasons(enum.Enum):
@@ -253,3 +238,29 @@ class Email(db.ModelBase):
         nullable=True,
     )
     transient_bounces = Column(Integer, nullable=False, server_default=sql.text("0"))
+
+
+class ProhibitedUserName(db.Model):
+
+    __tablename__ = "prohibited_user_names"
+    __table_args__ = (
+        CheckConstraint(
+            "length(name) <= 50", name="prohibited_users_valid_username_length"
+        ),
+        CheckConstraint(
+            "name ~* '^([A-Z0-9]|[A-Z0-9][A-Z0-9._-]*[A-Z0-9])$'",
+            name="prohibited_users_valid_username",
+        ),
+    )
+
+    __repr__ = make_repr("name")
+
+    created = Column(
+        DateTime(timezone=False), nullable=False, server_default=sql.func.now()
+    )
+    name = Column(Text, unique=True, nullable=False)
+    _prohibited_by = Column(
+        "prohibited_by", UUID(as_uuid=True), ForeignKey("users.id"), index=True
+    )
+    prohibited_by = orm.relationship(User)
+    comment = Column(Text, nullable=False, server_default="")

@@ -16,15 +16,22 @@ import io
 import pyqrcode
 
 from paginate_sqlalchemy import SqlalchemyOrmPage as SQLAlchemyORMPage
-from pyramid.httpexceptions import HTTPBadRequest, HTTPNotFound, HTTPSeeOther
+from pyramid.httpexceptions import (
+    HTTPBadRequest,
+    HTTPNotFound,
+    HTTPSeeOther,
+    HTTPTooManyRequests,
+)
 from pyramid.response import Response
 from pyramid.view import view_config, view_defaults
 from sqlalchemy import func
 from sqlalchemy.orm import Load, joinedload
 from sqlalchemy.orm.exc import NoResultFound
+from webauthn.helpers import bytes_to_base64url
 
 import warehouse.utils.otp as otp
 
+from warehouse.accounts.forms import RecoveryCodeAuthenticationForm
 from warehouse.accounts.interfaces import (
     IPasswordBreachedService,
     ITokenService,
@@ -36,17 +43,34 @@ from warehouse.accounts.views import logout
 from warehouse.admin.flags import AdminFlagValue
 from warehouse.email import (
     send_account_deletion_email,
+    send_admin_new_organization_requested_email,
+    send_admin_organization_deleted_email,
+    send_admin_organization_renamed_email,
+    send_canceled_as_invited_organization_member_email,
     send_collaborator_removed_email,
     send_collaborator_role_changed_email,
     send_email_verification_email,
+    send_new_organization_requested_email,
+    send_oidc_provider_added_email,
+    send_oidc_provider_removed_email,
+    send_organization_deleted_email,
+    send_organization_member_invite_canceled_email,
+    send_organization_member_invited_email,
+    send_organization_member_removed_email,
+    send_organization_member_role_changed_email,
+    send_organization_renamed_email,
+    send_organization_role_verification_email,
     send_password_change_email,
     send_primary_email_change_email,
     send_project_role_verification_email,
+    send_recovery_codes_generated_email,
     send_removed_as_collaborator_email,
+    send_removed_as_organization_member_email,
     send_removed_project_email,
     send_removed_project_release_email,
     send_removed_project_release_file_email,
     send_role_changed_as_collaborator_email,
+    send_role_changed_as_organization_member_email,
     send_two_factor_added_email,
     send_two_factor_removed_email,
     send_unyanked_project_release_email,
@@ -56,10 +80,13 @@ from warehouse.forklift.legacy import MAX_FILESIZE, MAX_PROJECT_SIZE
 from warehouse.macaroons.interfaces import IMacaroonService
 from warehouse.manage.forms import (
     AddEmailForm,
+    ChangeOrganizationRoleForm,
     ChangePasswordForm,
     ChangeRoleForm,
     ConfirmPasswordForm,
     CreateMacaroonForm,
+    CreateOrganizationForm,
+    CreateOrganizationRoleForm,
     CreateRoleForm,
     DeleteMacaroonForm,
     DeleteTOTPForm,
@@ -67,18 +94,33 @@ from warehouse.manage.forms import (
     ProvisionTOTPForm,
     ProvisionWebAuthnForm,
     SaveAccountForm,
+    SaveOrganizationForm,
+    SaveOrganizationNameForm,
+    Toggle2FARequirementForm,
+)
+from warehouse.metrics.interfaces import IMetricsService
+from warehouse.oidc.forms import DeleteProviderForm, GitHubProviderForm
+from warehouse.oidc.interfaces import TooManyOIDCRegistrations
+from warehouse.oidc.models import GitHubProvider, OIDCProvider
+from warehouse.organizations.interfaces import IOrganizationService
+from warehouse.organizations.models import (
+    Organization,
+    OrganizationInvitationStatus,
+    OrganizationRole,
+    OrganizationRoleType,
 )
 from warehouse.packaging.models import (
     File,
     JournalEntry,
     Project,
-    ProjectEvent,
     Release,
     Role,
     RoleInvitation,
     RoleInvitationStatus,
 )
+from warehouse.rate_limiting import IRateLimiter
 from warehouse.utils.http import is_safe_url
+from warehouse.utils.organization import confirm_organization
 from warehouse.utils.paginate import paginate_url_factory
 from warehouse.utils.project import confirm_project, destroy_docs, remove_project
 
@@ -89,6 +131,13 @@ def user_projects(request):
         request.db.query(Project.id)
         .join(Role.project)
         .filter(Role.role_name == "Owner", Role.user == request.user)
+        .subquery()
+    )
+
+    projects_collaborator = (
+        request.db.query(Project.id)
+        .join(Role.project)
+        .filter(Role.user == request.user)
         .subquery()
     )
 
@@ -111,7 +160,25 @@ def user_projects(request):
         "projects_sole_owned": (
             request.db.query(Project).join(with_sole_owner).order_by(Project.name).all()
         ),
+        "projects_requiring_2fa": (
+            request.db.query(Project)
+            .join(projects_collaborator, Project.id == projects_collaborator.c.id)
+            .filter(Project.two_factor_required)
+            .order_by(Project.name)
+            .all()
+        ),
     }
+
+
+def project_owners(request, project):
+    """Return all users who are owners of the project."""
+    owner_roles = (
+        request.db.query(User.id)
+        .join(Role.user)
+        .filter(Role.role_name == "Owner", Role.project == project)
+        .subquery()
+    )
+    return request.db.query(User).join(owner_roles, User.id == owner_roles.c.id).all()
 
 
 @view_defaults(
@@ -149,7 +216,9 @@ class ManageAccountViews:
                 user_service=self.user_service, user_id=self.request.user.id
             ),
             "change_password_form": ChangePasswordForm(
-                user_service=self.user_service, breach_service=self.breach_service
+                request=self.request,
+                user_service=self.user_service,
+                breach_service=self.breach_service,
             ),
             "active_projects": self.active_projects,
         }
@@ -189,13 +258,10 @@ class ManageAccountViews:
         )
 
         if form.validate():
-            email = self.user_service.add_email(
-                self.request.user.id, form.email.data, self.request.remote_addr
-            )
+            email = self.user_service.add_email(self.request.user.id, form.email.data)
             self.user_service.record_event(
                 self.request.user.id,
                 tag="account:email:add",
-                ip_address=self.request.remote_addr,
                 additional={"email": email.email},
             )
 
@@ -239,7 +305,6 @@ class ManageAccountViews:
             self.user_service.record_event(
                 self.request.user.id,
                 tag="account:email:remove",
-                ip_address=self.request.remote_addr,
                 additional={"email": email.email},
             )
             self.request.session.flash(
@@ -274,7 +339,6 @@ class ManageAccountViews:
         self.user_service.record_event(
             self.request.user.id,
             tag="account:email:primary:change",
-            ip_address=self.request.remote_addr,
             additional={
                 "old_primary": previous_primary_email.email
                 if previous_primary_email
@@ -328,6 +392,7 @@ class ManageAccountViews:
     def change_password(self):
         form = ChangePasswordForm(
             **self.request.POST,
+            request=self.request,
             username=self.request.user.username,
             full_name=self.request.user.name,
             email=self.request.user.email,
@@ -343,9 +408,13 @@ class ManageAccountViews:
             self.user_service.record_event(
                 self.request.user.id,
                 tag="account:password:change",
-                ip_address=self.request.remote_addr,
             )
             send_password_change_email(self.request, self.request.user)
+            self.request.db.flush()  # Ensure changes are persisted to DB
+            self.request.db.refresh(self.request.user)  # Pickup new password_date
+            self.request.session.record_password_timestamp(
+                self.user_service.get_password_timestamp(self.request.user.id)
+            )
             self.request.session.flash("Password updated", queue="success")
 
         return {**self.default_response, "change_password_form": form}
@@ -360,6 +429,7 @@ class ManageAccountViews:
             return self.default_response
 
         form = ConfirmPasswordForm(
+            request=self.request,
             password=confirm_password,
             username=self.request.user.username,
             user_service=self.user_service,
@@ -402,6 +472,20 @@ class ManageAccountViews:
         return logout(self.request)
 
 
+@view_config(
+    route_name="manage.account.two-factor",
+    renderer="manage/account/two-factor.html",
+    uses_session=True,
+    require_csrf=True,
+    require_methods=False,
+    permission="manage:user",
+    has_translations=True,
+    require_reauth=True,
+)
+def manage_two_factor(request):
+    return {}
+
+
 @view_defaults(
     route_name="manage.account.totp-provision",
     renderer="manage/account/totp-provision.html",
@@ -436,7 +520,7 @@ class ProvisionTOTPViews:
             self.request.session.flash(
                 "Verify your email to modify two factor authentication", queue="error"
             )
-            return Response(status=403)
+            return HTTPSeeOther(self.request.route_path("manage.account"))
 
         totp_secret = self.user_service.get_totp_secret(self.request.user.id)
         if totp_secret:
@@ -450,11 +534,16 @@ class ProvisionTOTPViews:
 
     @view_config(request_method="GET")
     def totp_provision(self):
+        if not self.request.user.has_burned_recovery_codes:
+            return HTTPSeeOther(
+                self.request.route_path("manage.account.recovery-codes.burn")
+            )
+
         if not self.request.user.has_primary_verified_email:
             self.request.session.flash(
                 "Verify your email to modify two factor authentication", queue="error"
             )
-            return Response(status=403)
+            return HTTPSeeOther(self.request.route_path("manage.account"))
 
         totp_secret = self.user_service.get_totp_secret(self.request.user.id)
         if totp_secret:
@@ -473,7 +562,7 @@ class ProvisionTOTPViews:
             self.request.session.flash(
                 "Verify your email to modify two factor authentication", queue="error"
             )
-            return Response(status=403)
+            return HTTPSeeOther(self.request.route_path("manage.account"))
 
         totp_secret = self.user_service.get_totp_secret(self.request.user.id)
         if totp_secret:
@@ -496,7 +585,6 @@ class ProvisionTOTPViews:
             self.user_service.record_event(
                 self.request.user.id,
                 tag="account:two_factor:method_added",
-                ip_address=self.request.remote_addr,
                 additional={"method": "totp"},
             )
             self.request.session.flash(
@@ -514,7 +602,7 @@ class ProvisionTOTPViews:
             self.request.session.flash(
                 "Verify your email to modify two factor authentication", queue="error"
             )
-            return Response(status=403)
+            return HTTPSeeOther(self.request.route_path("manage.account"))
 
         totp_secret = self.user_service.get_totp_secret(self.request.user.id)
         if not totp_secret:
@@ -524,6 +612,7 @@ class ProvisionTOTPViews:
             return HTTPSeeOther(self.request.route_path("manage.account"))
 
         form = DeleteTOTPForm(
+            request=self.request,
             password=self.request.POST["confirm_password"],
             username=self.request.user.username,
             user_service=self.user_service,
@@ -534,7 +623,6 @@ class ProvisionTOTPViews:
             self.user_service.record_event(
                 self.request.user.id,
                 tag="account:two_factor:method_removed",
-                ip_address=self.request.remote_addr,
                 additional={"method": "totp"},
             )
             self.request.session.flash(
@@ -570,6 +658,10 @@ class ProvisionWebAuthnViews:
         renderer="manage/account/webauthn-provision.html",
     )
     def webauthn_provision(self):
+        if not self.request.user.has_burned_recovery_codes:
+            return HTTPSeeOther(
+                self.request.route_path("manage.account.recovery-codes.burn")
+            )
         return {}
 
     @view_config(
@@ -607,14 +699,17 @@ class ProvisionWebAuthnViews:
             self.user_service.add_webauthn(
                 self.request.user.id,
                 label=form.label.data,
-                credential_id=form.validated_credential.credential_id.decode(),
-                public_key=form.validated_credential.public_key.decode(),
+                credential_id=bytes_to_base64url(
+                    form.validated_credential.credential_id
+                ),
+                public_key=bytes_to_base64url(
+                    form.validated_credential.credential_public_key
+                ),
                 sign_count=form.validated_credential.sign_count,
             )
             self.user_service.record_event(
                 self.request.user.id,
                 tag="account:two_factor:method_added",
-                ip_address=self.request.remote_addr,
                 additional={"method": "webauthn", "label": form.label.data},
             )
             self.request.session.flash(
@@ -655,7 +750,6 @@ class ProvisionWebAuthnViews:
             self.user_service.record_event(
                 self.request.user.id,
                 tag="account:two_factor:method_removed",
-                ip_address=self.request.remote_addr,
                 additional={"method": "webauthn", "label": form.label.data},
             )
             self.request.session.flash("Security device removed", queue="success")
@@ -685,18 +779,9 @@ class ProvisionRecoveryCodesViews:
         request_method="GET",
         route_name="manage.account.recovery-codes.generate",
         renderer="manage/account/recovery_codes-provision.html",
+        require_reauth=10,  # 10 seconds
     )
     def recovery_codes_generate(self):
-        if not self.user_service.has_two_factor(self.request.user.id):
-            self.request.session.flash(
-                self.request._(
-                    "You must provision a two factor method before recovery "
-                    "codes can be generated"
-                ),
-                queue="error",
-            )
-            return HTTPSeeOther(self.request.route_path("manage.account"))
-
         if self.user_service.has_recovery_codes(self.request.user.id):
             return {
                 "recovery_codes": None,
@@ -706,55 +791,60 @@ class ProvisionRecoveryCodesViews:
                 ),
             }
 
+        recovery_codes = self.user_service.generate_recovery_codes(self.request.user.id)
+        send_recovery_codes_generated_email(self.request, self.request.user)
         self.user_service.record_event(
             self.request.user.id,
             tag="account:recovery_codes:generated",
-            ip_address=self.request.remote_addr,
         )
-        return {
-            "recovery_codes": self.user_service.generate_recovery_codes(
-                self.request.user.id
-            )
-        }
+
+        return {"recovery_codes": recovery_codes}
 
     @view_config(
-        request_method="POST",
+        request_method="GET",
         route_name="manage.account.recovery-codes.regenerate",
         renderer="manage/account/recovery_codes-provision.html",
+        require_reauth=10,  # 10 seconds
     )
     def recovery_codes_regenerate(self):
-        if not self.user_service.has_two_factor(self.request.user.id):
-            self.request.session.flash(
-                self.request._(
-                    "You must provision a two factor method before recovery "
-                    "codes can be generated"
-                ),
-                queue="error",
-            )
-            return HTTPSeeOther(self.request.route_path("manage.account"))
+        recovery_codes = self.user_service.generate_recovery_codes(self.request.user.id)
+        send_recovery_codes_generated_email(self.request, self.request.user)
+        self.user_service.record_event(
+            self.request.user.id,
+            tag="account:recovery_codes:regenerated",
+        )
 
-        form = ConfirmPasswordForm(
-            password=self.request.POST["confirm_password"],
-            username=self.request.user.username,
+        return {"recovery_codes": recovery_codes}
+
+    @view_config(
+        route_name="manage.account.recovery-codes.burn",
+        renderer="manage/account/recovery_codes-burn.html",
+    )
+    def recovery_codes_burn(self, _form_class=RecoveryCodeAuthenticationForm):
+        user = self.user_service.get_user(self.request.user.id)
+
+        if not user.has_recovery_codes:
+            return HTTPSeeOther(self.request.route_path("manage.account"))
+        if user.has_burned_recovery_codes:
+            return HTTPSeeOther(self.request.route_path("manage.account.two-factor"))
+
+        form = _form_class(
+            self.request.POST,
+            request=self.request,
+            user_id=user.id,
             user_service=self.user_service,
         )
 
-        if form.validate():
-            self.user_service.record_event(
-                self.request.user.id,
-                tag="account:recovery_codes:regenerated",
-                ip_address=self.request.remote_addr,
+        if self.request.method == "POST" and form.validate():
+            self.request.session.flash(
+                self.request._(
+                    "Recovery code accepted. The supplied code cannot be used again."
+                ),
+                queue="success",
             )
-            return {
-                "recovery_codes": self.user_service.generate_recovery_codes(
-                    self.request.user.id
-                )
-            }
+            return HTTPSeeOther(self.request.route_path("manage.account.two-factor"))
 
-        self.request.session.flash(
-            self.request._("Invalid credentials. Try again"), queue="error"
-        )
-        return HTTPSeeOther(self.request.route_path("manage.account"))
+        return {"form": form}
 
 
 @view_defaults(
@@ -787,6 +877,7 @@ class ProvisionMacaroonViews:
                 project_names=self.project_names,
             ),
             "delete_macaroon_form": DeleteMacaroonForm(
+                request=self.request,
                 username=self.request.user.username,
                 user_service=self.user_service,
                 macaroon_service=self.macaroon_service,
@@ -814,7 +905,7 @@ class ProvisionMacaroonViews:
 
         response = {**self.default_response}
         if form.validate():
-            macaroon_caveats = {"permissions": form.validated_scope, "version": 1}
+            macaroon_caveats = [{"permissions": form.validated_scope, "version": 1}]
             serialized_macaroon, macaroon = self.macaroon_service.create_macaroon(
                 location=self.request.domain,
                 user_id=self.request.user.id,
@@ -824,7 +915,6 @@ class ProvisionMacaroonViews:
             self.user_service.record_event(
                 self.request.user.id,
                 tag="account:api_token:added",
-                ip_address=self.request.remote_addr,
                 additional={
                     "description": form.description.data,
                     "caveats": macaroon_caveats,
@@ -861,6 +951,7 @@ class ProvisionMacaroonViews:
     )
     def delete_macaroon(self):
         form = DeleteMacaroonForm(
+            request=self.request,
             password=self.request.POST["confirm_password"],
             macaroon_id=self.request.POST["macaroon_id"],
             macaroon_service=self.macaroon_service,
@@ -874,15 +965,14 @@ class ProvisionMacaroonViews:
             self.user_service.record_event(
                 self.request.user.id,
                 tag="account:api_token:removed",
-                ip_address=self.request.remote_addr,
                 additional={"macaroon_id": form.macaroon_id.data},
             )
-            if "projects" in macaroon.caveats["permissions"]:
+            if "projects" in macaroon.permissions_caveat:
                 projects = [
                     project
                     for project in self.request.user.projects
                     if project.normalized_name
-                    in macaroon.caveats["permissions"]["projects"]
+                    in macaroon.permissions_caveat["projects"]
                 ]
                 for project in projects:
                     project.record_event(
@@ -905,6 +995,764 @@ class ProvisionMacaroonViews:
         return HTTPSeeOther(redirect_to)
 
 
+def user_organizations(request):
+    """Return all the organizations for which the user has a privileged role."""
+    organizations_managed = (
+        request.db.query(Organization.id)
+        .join(OrganizationRole.organization)
+        .filter(
+            OrganizationRole.role_name == OrganizationRoleType.Manager,
+            OrganizationRole.user == request.user,
+        )
+        .subquery()
+    )
+    organizations_owned = (
+        request.db.query(Organization.id)
+        .join(OrganizationRole.organization)
+        .filter(
+            OrganizationRole.role_name == OrganizationRoleType.Owner,
+            OrganizationRole.user == request.user,
+        )
+        .subquery()
+    )
+    organizations_billing = (
+        request.db.query(Organization.id)
+        .join(OrganizationRole.organization)
+        .filter(
+            OrganizationRole.role_name == OrganizationRoleType.BillingManager,
+            OrganizationRole.user == request.user,
+        )
+        .subquery()
+    )
+    return {
+        "organizations_owned": (
+            request.db.query(Organization)
+            .join(organizations_owned, Organization.id == organizations_owned.c.id)
+            .order_by(Organization.name)
+            .all()
+        ),
+        "organizations_managed": (
+            request.db.query(Organization)
+            .join(organizations_managed, Organization.id == organizations_managed.c.id)
+            .order_by(Organization.name)
+            .all()
+        ),
+        "organizations_billing": (
+            request.db.query(Organization)
+            .join(organizations_billing, Organization.id == organizations_billing.c.id)
+            .order_by(Organization.name)
+            .all()
+        ),
+    }
+
+
+def organization_owners(request, organization):
+    """Return all users who are owners of the organization."""
+    owner_roles = (
+        request.db.query(User.id)
+        .join(OrganizationRole.user)
+        .filter(
+            OrganizationRole.role_name == OrganizationRoleType.Owner,
+            OrganizationRole.organization == organization,
+        )
+        .subquery()
+    )
+    return request.db.query(User).join(owner_roles, User.id == owner_roles.c.id).all()
+
+
+@view_defaults(
+    route_name="manage.organizations",
+    renderer="manage/organizations.html",
+    uses_session=True,
+    require_csrf=True,
+    require_methods=False,
+    permission="manage:user",
+    has_translations=True,
+)
+class ManageOrganizationsViews:
+    def __init__(self, request):
+        self.request = request
+        self.user_service = request.find_service(IUserService, context=None)
+        self.organization_service = request.find_service(
+            IOrganizationService, context=None
+        )
+
+    @property
+    def default_response(self):
+        all_user_organizations = user_organizations(self.request)
+
+        organization_invites = (
+            self.organization_service.get_organization_invites_by_user(
+                self.request.user.id
+            )
+        )
+        organization_invites = [
+            (organization_invite.organization, organization_invite.token)
+            for organization_invite in organization_invites
+        ]
+
+        return {
+            "organization_invites": organization_invites,
+            "organizations": self.organization_service.get_organizations_by_user(
+                self.request.user.id
+            ),
+            "organizations_managed": list(
+                organization.name
+                for organization in all_user_organizations["organizations_managed"]
+            ),
+            "organizations_owned": list(
+                organization.name
+                for organization in all_user_organizations["organizations_owned"]
+            ),
+            "organizations_billing": list(
+                organization.name
+                for organization in all_user_organizations["organizations_billing"]
+            ),
+            "create_organization_form": CreateOrganizationForm(
+                organization_service=self.organization_service,
+            ),
+        }
+
+    @view_config(request_method="GET")
+    def manage_organizations(self):
+        if self.request.flags.enabled(AdminFlagValue.DISABLE_ORGANIZATIONS):
+            raise HTTPNotFound
+
+        return self.default_response
+
+    @view_config(request_method="POST", request_param=CreateOrganizationForm.__params__)
+    def create_organization(self):
+        if self.request.flags.enabled(AdminFlagValue.DISABLE_ORGANIZATIONS):
+            raise HTTPNotFound
+
+        form = CreateOrganizationForm(
+            self.request.POST,
+            organization_service=self.organization_service,
+        )
+
+        if form.validate():
+            data = form.data
+            organization = self.organization_service.add_organization(**data)
+            self.organization_service.record_event(
+                organization.id,
+                tag="organization:create",
+                additional={"created_by_user_id": str(self.request.user.id)},
+            )
+            self.organization_service.add_catalog_entry(organization.id)
+            self.organization_service.record_event(
+                organization.id,
+                tag="organization:catalog_entry:add",
+                additional={"submitted_by_user_id": str(self.request.user.id)},
+            )
+            self.organization_service.add_organization_role(
+                organization.id,
+                self.request.user.id,
+                OrganizationRoleType.Owner,
+            )
+            self.organization_service.record_event(
+                organization.id,
+                tag="organization:organization_role:invite",
+                additional={
+                    "submitted_by_user_id": str(self.request.user.id),
+                    "role_name": "Owner",
+                    "target_user_id": str(self.request.user.id),
+                },
+            )
+            self.organization_service.record_event(
+                organization.id,
+                tag="organization:organization_role:accepted",
+                additional={
+                    "submitted_by_user_id": str(self.request.user.id),
+                    "role_name": "Owner",
+                    "target_user_id": str(self.request.user.id),
+                },
+            )
+            self.user_service.record_event(
+                self.request.user.id,
+                tag="account:organization_role:accepted",
+                additional={
+                    "submitted_by_user_id": str(self.request.user.id),
+                    "organization_name": organization.name,
+                    "role_name": "Owner",
+                },
+            )
+            send_admin_new_organization_requested_email(
+                self.request,
+                self.user_service.get_admins(),
+                organization_name=organization.name,
+                initiator_username=self.request.user.username,
+                organization_id=organization.id,
+            )
+            send_new_organization_requested_email(
+                self.request, self.request.user, organization_name=organization.name
+            )
+            self.request.session.flash(
+                "Request for new organization submitted", queue="success"
+            )
+        else:
+            return {"create_organization_form": form}
+
+        return self.default_response
+
+
+@view_defaults(
+    route_name="manage.organization.settings",
+    context=Organization,
+    renderer="manage/organization/settings.html",
+    uses_session=True,
+    require_csrf=True,
+    require_methods=False,
+    permission="view:organization",
+    has_translations=True,
+    require_reauth=True,
+)
+class ManageOrganizationSettingsViews:
+    def __init__(self, organization, request):
+        self.organization = organization
+        self.request = request
+        self.user_service = request.find_service(IUserService, context=None)
+        self.organization_service = request.find_service(
+            IOrganizationService, context=None
+        )
+
+    @property
+    def active_projects(self):
+        return self.organization.projects
+
+    @property
+    def default_response(self):
+        return {
+            "organization": self.organization,
+            "save_organization_form": SaveOrganizationForm(
+                name=self.organization.name,
+                display_name=self.organization.display_name,
+                link_url=self.organization.link_url,
+                description=self.organization.description,
+                orgtype=self.organization.orgtype,
+                organization_service=self.organization_service,
+            ),
+            "active_projects": self.active_projects,
+        }
+
+    @view_config(request_method="GET")
+    def manage_organization(self):
+        if self.request.flags.enabled(AdminFlagValue.DISABLE_ORGANIZATIONS):
+            raise HTTPNotFound
+
+        return self.default_response
+
+    @view_config(request_method="POST", request_param=SaveOrganizationForm.__params__)
+    def save_organization(self):
+        if self.request.flags.enabled(AdminFlagValue.DISABLE_ORGANIZATIONS):
+            raise HTTPNotFound
+
+        form = SaveOrganizationForm(
+            self.request.POST,
+            organization_service=self.organization_service,
+        )
+
+        if form.validate():
+            data = form.data
+            self.organization_service.update_organization(self.organization.id, **data)
+            self.request.session.flash("Organization details updated", queue="success")
+
+        return {**self.default_response, "save_organization_form": form}
+
+    @view_config(
+        request_method="POST",
+        request_param=["confirm_current_organization_name"]
+        + SaveOrganizationNameForm.__params__,
+    )
+    def save_organization_name(self):
+        if self.request.flags.enabled(AdminFlagValue.DISABLE_ORGANIZATIONS):
+            raise HTTPNotFound
+
+        confirm_organization(
+            self.organization,
+            self.request,
+            fail_route="manage.organization.settings",
+            field_name="confirm_current_organization_name",
+            error_message="Could not rename organization",
+        )
+
+        form = SaveOrganizationNameForm(
+            self.request.POST,
+            organization_service=self.organization_service,
+        )
+
+        if form.validate():
+            previous_organization_name = self.organization.name
+            self.organization_service.rename_organization(
+                self.organization.id,
+                form.name.data,
+            )
+            self.organization.record_event(
+                tag="organization:rename",
+                ip_address=self.request.remote_addr,
+                additional={
+                    "previous_organization_name": previous_organization_name,
+                    "renamed_by_user_id": str(self.request.user.id),
+                },
+            )
+            owner_users = set(organization_owners(self.request, self.organization))
+            send_admin_organization_renamed_email(
+                self.request,
+                self.user_service.get_admins(),
+                organization_name=self.organization.name,
+                previous_organization_name=previous_organization_name,
+            )
+            send_organization_renamed_email(
+                self.request,
+                owner_users,
+                organization_name=self.organization.name,
+                previous_organization_name=previous_organization_name,
+            )
+            self.request.session.flash(
+                "Organization account name updated", queue="success"
+            )
+            return HTTPSeeOther(
+                self.request.route_path(
+                    "manage.organization.settings",
+                    organization_name=self.organization.normalized_name,
+                )
+            )
+        else:
+            for error_list in form.errors.values():
+                for error in error_list:
+                    self.request.session.flash(error, queue="error")
+
+        return self.default_response
+
+    @view_config(request_method="POST", request_param=["confirm_organization_name"])
+    def delete_organization(self):
+        if self.request.flags.enabled(AdminFlagValue.DISABLE_ORGANIZATIONS):
+            raise HTTPNotFound
+
+        confirm_organization(
+            self.organization, self.request, fail_route="manage.organization.settings"
+        )
+
+        if self.active_projects:
+            self.request.session.flash(
+                "Cannot delete organization with active project ownerships",
+                queue="error",
+            )
+            return self.default_response
+
+        # Record event before deleting organization.
+        self.organization.record_event(
+            tag="organization:delete",
+            ip_address=self.request.remote_addr,
+            additional={
+                "deleted_by_user_id": str(self.request.user.id),
+            },
+        )
+
+        # Get owners before deleting organization.
+        owner_users = set(organization_owners(self.request, self.organization))
+
+        self.organization_service.delete_organization(self.organization.id)
+
+        send_admin_organization_deleted_email(
+            self.request,
+            self.user_service.get_admins(),
+            organization_name=self.organization.name,
+        )
+        send_organization_deleted_email(
+            self.request,
+            owner_users,
+            organization_name=self.organization.name,
+        )
+
+        return HTTPSeeOther(self.request.route_path("manage.organizations"))
+
+
+@view_config(
+    route_name="manage.organization.roles",
+    context=Organization,
+    renderer="manage/organization/roles.html",
+    uses_session=True,
+    require_methods=False,
+    permission="view:organization",
+    has_translations=True,
+    require_reauth=True,
+)
+def manage_organization_roles(
+    organization, request, _form_class=CreateOrganizationRoleForm
+):
+    if request.flags.enabled(AdminFlagValue.DISABLE_ORGANIZATIONS):
+        raise HTTPNotFound
+
+    organization_service = request.find_service(IOrganizationService, context=None)
+    user_service = request.find_service(IUserService, context=None)
+    form = _form_class(
+        request.POST,
+        orgtype=organization.orgtype,
+        organization_service=organization_service,
+        user_service=user_service,
+    )
+
+    if request.method == "POST" and form.validate():
+        username = form.username.data
+        role_name = form.role_name.data
+        userid = user_service.find_userid(username)
+        user = user_service.get_user(userid)
+        token_service = request.find_service(ITokenService, name="email")
+
+        existing_role = organization_service.get_organization_role_by_user(
+            organization.id, user.id
+        )
+        organization_invite = organization_service.get_organization_invite_by_user(
+            organization.id, user.id
+        )
+        # Cover edge case where invite is invalid but task
+        # has not updated invite status
+        try:
+            invite_token = token_service.loads(organization_invite.token)
+        except (TokenExpired, AttributeError):
+            invite_token = None
+
+        if existing_role:
+            request.session.flash(
+                request._(
+                    "User '${username}' already has ${role_name} role for organization",
+                    mapping={
+                        "username": username,
+                        "role_name": existing_role.role_name.value,
+                    },
+                ),
+                queue="error",
+            )
+        elif user.primary_email is None or not user.primary_email.verified:
+            request.session.flash(
+                request._(
+                    "User '${username}' does not have a verified primary email "
+                    "address and cannot be added as a ${role_name} for organization",
+                    mapping={"username": username, "role_name": role_name.value},
+                ),
+                queue="error",
+            )
+        elif (
+            organization_invite
+            and organization_invite.invite_status
+            == OrganizationInvitationStatus.Pending
+            and invite_token
+        ):
+            request.session.flash(
+                request._(
+                    "User '${username}' already has an active invite. "
+                    "Please try again later.",
+                    mapping={"username": username},
+                ),
+                queue="error",
+            )
+        else:
+            invite_token = token_service.dumps(
+                {
+                    "action": "email-organization-role-verify",
+                    "desired_role": role_name.value,
+                    "user_id": user.id,
+                    "organization_id": organization.id,
+                    "submitter_id": request.user.id,
+                }
+            )
+            if organization_invite:
+                organization_invite.invite_status = OrganizationInvitationStatus.Pending
+                organization_invite.token = invite_token
+            else:
+                organization_service.add_organization_invite(
+                    organization_id=organization.id,
+                    user_id=user.id,
+                    invite_token=invite_token,
+                )
+            organization.record_event(
+                tag="organization:organization_role:invite",
+                ip_address=request.remote_addr,
+                additional={
+                    "submitted_by_user_id": str(request.user.id),
+                    "role_name": role_name.value,
+                    "target_user_id": str(userid),
+                },
+            )
+            request.db.flush()  # in order to get id
+            owner_users = set(organization_owners(request, organization))
+            send_organization_member_invited_email(
+                request,
+                owner_users,
+                user=user,
+                desired_role=role_name.value,
+                initiator_username=request.user.username,
+                organization_name=organization.name,
+                email_token=invite_token,
+                token_age=token_service.max_age,
+            )
+            send_organization_role_verification_email(
+                request,
+                user,
+                desired_role=role_name.value,
+                initiator_username=request.user.username,
+                organization_name=organization.name,
+                email_token=invite_token,
+                token_age=token_service.max_age,
+            )
+            request.session.flash(
+                request._(
+                    "Invitation sent to '${username}'",
+                    mapping={"username": username},
+                ),
+                queue="success",
+            )
+
+        form = _form_class(
+            orgtype=organization.orgtype,
+            organization_service=organization_service,
+            user_service=user_service,
+        )
+
+    roles = set(organization_service.get_organization_roles(organization.id))
+    invitations = set(organization_service.get_organization_invites(organization.id))
+
+    return {
+        "organization": organization,
+        "roles": roles,
+        "invitations": invitations,
+        "form": form,
+    }
+
+
+@view_config(
+    route_name="manage.organization.revoke_invite",
+    context=Organization,
+    uses_session=True,
+    require_methods=["POST"],
+    permission="manage:organization",
+    has_translations=True,
+)
+def revoke_organization_invitation(organization, request):
+    organization_service = request.find_service(IOrganizationService, context=None)
+    user_service = request.find_service(IUserService, context=None)
+    token_service = request.find_service(ITokenService, name="email")
+    user = user_service.get_user(request.POST["user_id"])
+
+    organization_invite = organization_service.get_organization_invite_by_user(
+        organization.id, user.id
+    )
+    if organization_invite is None:
+        request.session.flash(
+            request._("Could not find organization invitation."), queue="error"
+        )
+        return HTTPSeeOther(
+            request.route_path(
+                "manage.organization.roles",
+                organization_name=organization.normalized_name,
+            )
+        )
+
+    organization_service.delete_organization_invite(organization_invite.id)
+
+    try:
+        token_data = token_service.loads(organization_invite.token)
+    except TokenExpired:
+        request.session.flash(request._("Invitation already expired."), queue="success")
+        return HTTPSeeOther(
+            request.route_path(
+                "manage.organization.roles",
+                organization_name=organization.normalized_name,
+            )
+        )
+    role_name = token_data.get("desired_role")
+
+    organization.record_event(
+        tag="organization:organization_role:revoke_invite",
+        ip_address=request.remote_addr,
+        additional={
+            "submitted_by_user_id": str(request.user.id),
+            "role_name": role_name,
+            "target_user_id": str(user.id),
+        },
+    )
+
+    owner_users = set(organization_owners(request, organization))
+    send_organization_member_invite_canceled_email(
+        request,
+        owner_users,
+        user=user,
+        organization_name=organization.name,
+    )
+    send_canceled_as_invited_organization_member_email(
+        request,
+        user,
+        organization_name=organization.name,
+    )
+
+    request.session.flash(
+        request._(
+            "Invitation revoked from '${username}'.",
+            mapping={"username": user.username},
+        ),
+        queue="success",
+    )
+
+    return HTTPSeeOther(
+        request.route_path(
+            "manage.organization.roles", organization_name=organization.normalized_name
+        )
+    )
+
+
+@view_config(
+    route_name="manage.organization.change_role",
+    context=Organization,
+    uses_session=True,
+    require_methods=["POST"],
+    permission="manage:organization",
+    has_translations=True,
+    require_reauth=True,
+)
+def change_organization_role(
+    organization, request, _form_class=ChangeOrganizationRoleForm
+):
+    form = _form_class(request.POST, orgtype=organization.orgtype)
+
+    if form.validate():
+        organization_service = request.find_service(IOrganizationService, context=None)
+        role_id = request.POST["role_id"]
+        role = organization_service.get_organization_role(role_id)
+        if not role or role.organization_id != organization.id:
+            request.session.flash("Could not find member", queue="error")
+        elif role.role_name == OrganizationRoleType.Owner and role.user == request.user:
+            request.session.flash("Cannot remove yourself as Owner", queue="error")
+        else:
+            role.role_name = form.role_name.data
+
+            owner_users = set(organization_owners(request, organization))
+            # Don't send owner notification email to new user
+            # if they are now an owner
+            owner_users.discard(role.user)
+
+            send_organization_member_role_changed_email(
+                request,
+                owner_users,
+                user=role.user,
+                submitter=request.user,
+                organization_name=organization.name,
+                role=role.role_name,
+            )
+
+            send_role_changed_as_organization_member_email(
+                request,
+                role.user,
+                submitter=request.user,
+                organization_name=organization.name,
+                role=role.role_name,
+            )
+
+            organization.record_event(
+                tag="organization:organization_role:change",
+                ip_address=request.remote_addr,
+                additional={
+                    "submitted_by_user_id": str(request.user.id),
+                    "role_name": form.role_name.data,
+                    "target_user_id": str(role.user.id),
+                },
+            )
+            role.user.record_event(
+                tag="account:organization_role:change",
+                ip_address=request.remote_addr,
+                additional={
+                    "submitted_by_user_id": str(request.user.id),
+                    "organization_name": organization.name,
+                    "role_name": form.role_name.data,
+                },
+            )
+
+            request.session.flash("Changed role", queue="success")
+
+    return HTTPSeeOther(
+        request.route_path(
+            "manage.organization.roles", organization_name=organization.normalized_name
+        )
+    )
+
+
+@view_config(
+    route_name="manage.organization.delete_role",
+    context=Organization,
+    uses_session=True,
+    require_methods=["POST"],
+    permission="view:organization",
+    has_translations=True,
+    require_reauth=True,
+)
+def delete_organization_role(organization, request):
+    organization_service = request.find_service(IOrganizationService, context=None)
+    role_id = request.POST["role_id"]
+    role = organization_service.get_organization_role(role_id)
+    if not role or role.organization_id != organization.id:
+        request.session.flash("Could not find member", queue="error")
+    elif (
+        not request.has_permission("manage:organization") and role.user != request.user
+    ):
+        request.session.flash(
+            "Cannot remove other people from the organization", queue="error"
+        )
+    elif role.role_name == OrganizationRoleType.Owner and role.user == request.user:
+        request.session.flash("Cannot remove yourself as Owner", queue="error")
+    else:
+        organization_service.delete_organization_role(role.id)
+        organization.record_event(
+            tag="organization:organization_role:delete",
+            ip_address=request.remote_addr,
+            additional={
+                "submitted_by_user_id": str(request.user.id),
+                "role_name": role.role_name.value,
+                "target_user_id": str(role.user.id),
+            },
+        )
+        role.user.record_event(
+            tag="account:organization_role:delete",
+            ip_address=request.remote_addr,
+            additional={
+                "submitted_by_user_id": str(request.user.id),
+                "organization_name": organization.name,
+                "role_name": role.role_name.value,
+            },
+        )
+
+        owner_users = set(organization_owners(request, organization))
+        # Don't send owner notification email to new user
+        # if they are now an owner
+        owner_users.discard(role.user)
+
+        send_organization_member_removed_email(
+            request,
+            owner_users,
+            user=role.user,
+            submitter=request.user,
+            organization_name=organization.name,
+        )
+
+        send_removed_as_organization_member_email(
+            request,
+            role.user,
+            submitter=request.user,
+            organization_name=organization.name,
+        )
+
+        request.session.flash("Removed from organization", queue="success")
+
+    if role and role.user == request.user:
+        # User removed self from organization.
+        return HTTPSeeOther(request.route_path("manage.organizations"))
+    else:
+        return HTTPSeeOther(
+            request.route_path(
+                "manage.organization.roles",
+                organization_name=organization.normalized_name,
+            )
+        )
+
+
 @view_config(
     route_name="manage.projects",
     renderer="manage/projects.html",
@@ -925,6 +1773,10 @@ def manage_projects(request):
     projects_sole_owned = set(
         project.name for project in all_user_projects["projects_sole_owned"]
     )
+    projects_requiring_2fa = set(
+        project.name for project in all_user_projects["projects_requiring_2fa"]
+    )
+
     project_invites = (
         request.db.query(RoleInvitation)
         .filter(RoleInvitation.invite_status == RoleInvitationStatus.Pending)
@@ -938,11 +1790,12 @@ def manage_projects(request):
         "projects": sorted(request.user.projects, key=_key, reverse=True),
         "projects_owned": projects_owned,
         "projects_sole_owned": projects_sole_owned,
+        "projects_requiring_2fa": projects_requiring_2fa,
         "project_invites": project_invites,
     }
 
 
-@view_config(
+@view_defaults(
     route_name="manage.project.settings",
     context=Project,
     renderer="manage/settings.html",
@@ -950,13 +1803,313 @@ def manage_projects(request):
     permission="manage:project",
     has_translations=True,
     require_reauth=True,
+    require_methods=False,
 )
-def manage_project_settings(project, request):
-    return {
-        "project": project,
-        "MAX_FILESIZE": MAX_FILESIZE,
-        "MAX_PROJECT_SIZE": MAX_PROJECT_SIZE,
-    }
+class ManageProjectSettingsViews:
+    def __init__(self, project, request):
+        self.project = project
+        self.request = request
+        self.toggle_2fa_requirement_form_class = Toggle2FARequirementForm
+
+    @view_config(request_method="GET")
+    def manage_project_settings(self):
+        return {
+            "project": self.project,
+            "MAX_FILESIZE": MAX_FILESIZE,
+            "MAX_PROJECT_SIZE": MAX_PROJECT_SIZE,
+            "toggle_2fa_form": self.toggle_2fa_requirement_form_class(),
+        }
+
+    @view_config(
+        request_method="POST",
+        request_param=Toggle2FARequirementForm.__params__,
+        require_reauth=True,
+    )
+    def toggle_2fa_requirement(self):
+        if not self.request.registry.settings[
+            "warehouse.two_factor_requirement.enabled"
+        ]:
+            raise HTTPNotFound
+
+        if self.project.pypi_mandates_2fa:
+            self.request.session.flash(
+                "2FA requirement cannot be disabled for critical projects",
+                queue="error",
+            )
+        elif self.project.owners_require_2fa:
+            self.project.owners_require_2fa = False
+            self.project.record_event(
+                tag="project:owners_require_2fa:disabled",
+                ip_address=self.request.remote_addr,
+                additional={"modified_by": self.request.user.username},
+            )
+            self.request.session.flash(
+                f"2FA requirement disabled for { self.project.name }",
+                queue="success",
+            )
+        else:
+            self.project.owners_require_2fa = True
+            self.project.record_event(
+                tag="project:owners_require_2fa:enabled",
+                ip_address=self.request.remote_addr,
+                additional={"modified_by": self.request.user.username},
+            )
+            self.request.session.flash(
+                f"2FA requirement enabled for { self.project.name }",
+                queue="success",
+            )
+
+        return HTTPSeeOther(
+            self.request.route_path(
+                "manage.project.settings", project_name=self.project.name
+            )
+        )
+
+
+@view_defaults(
+    context=Project,
+    route_name="manage.project.settings.publishing",
+    renderer="manage/publishing.html",
+    uses_session=True,
+    require_csrf=True,
+    require_methods=False,
+    permission="manage:project",
+    has_translations=True,
+    require_reauth=True,
+    http_cache=0,
+)
+class ManageOIDCProviderViews:
+    def __init__(self, project, request):
+        self.request = request
+        self.project = project
+        self.oidc_enabled = self.request.registry.settings["warehouse.oidc.enabled"]
+        self.metrics = self.request.find_service(IMetricsService, context=None)
+
+    @property
+    def _ratelimiters(self):
+        return {
+            "user.oidc": self.request.find_service(
+                IRateLimiter, name="user_oidc.provider.register"
+            ),
+            "ip.oidc": self.request.find_service(
+                IRateLimiter, name="ip_oidc.provider.register"
+            ),
+        }
+
+    def _hit_ratelimits(self):
+        self._ratelimiters["user.oidc"].hit(self.request.user.id)
+        self._ratelimiters["ip.oidc"].hit(self.request.remote_addr)
+
+    def _check_ratelimits(self):
+        if not self._ratelimiters["user.oidc"].test(self.request.user.id):
+            raise TooManyOIDCRegistrations(
+                resets_in=self._ratelimiters["user.oidc"].resets_in(
+                    self.request.user.id
+                )
+            )
+
+        if not self._ratelimiters["ip.oidc"].test(self.request.remote_addr):
+            raise TooManyOIDCRegistrations(
+                resets_in=self._ratelimiters["ip.oidc"].resets_in(
+                    self.request.remote_addr
+                )
+            )
+
+    @property
+    def github_provider_form(self):
+        return GitHubProviderForm(
+            self.request.POST,
+            api_token=self.request.registry.settings.get("github.token"),
+        )
+
+    @property
+    def default_response(self):
+        return {
+            "oidc_enabled": self.oidc_enabled,
+            "project": self.project,
+            "github_provider_form": self.github_provider_form,
+        }
+
+    @view_config(request_method="GET")
+    def manage_project_oidc_providers(self):
+        if not self.oidc_enabled:
+            raise HTTPNotFound
+
+        if self.request.flags.enabled(AdminFlagValue.DISALLOW_OIDC):
+            self.request.session.flash(
+                (
+                    "OpenID Connect is temporarily disabled. "
+                    "See https://pypi.org/help#admin-intervention for details."
+                ),
+                queue="error",
+            )
+
+        return self.default_response
+
+    @view_config(request_method="POST", request_param=GitHubProviderForm.__params__)
+    def add_github_oidc_provider(self):
+        if not self.oidc_enabled:
+            raise HTTPNotFound
+
+        self.metrics.increment(
+            "warehouse.oidc.add_provider.attempt", tags=["provider:GitHub"]
+        )
+
+        if self.request.flags.enabled(AdminFlagValue.DISALLOW_OIDC):
+            self.request.session.flash(
+                (
+                    "OpenID Connect is temporarily disabled. "
+                    "See https://pypi.org/help#admin-intervention for details."
+                ),
+                queue="error",
+            )
+            return self.default_response
+
+        try:
+            self._check_ratelimits()
+        except TooManyOIDCRegistrations as exc:
+            self.metrics.increment(
+                "warehouse.oidc.add_provider.ratelimited", tags=["provider:GitHub"]
+            )
+            return HTTPTooManyRequests(
+                self.request._(
+                    "There have been too many attempted OpenID Connect registrations. "
+                    "Try again later."
+                ),
+                retry_after=exc.resets_in.total_seconds(),
+            )
+
+        self._hit_ratelimits()
+
+        response = self.default_response
+        form = response["github_provider_form"]
+
+        if form.validate():
+            # GitHub OIDC providers are unique on the tuple of
+            # (repository_name, repository_owner, workflow_filename), so we check for
+            # an already registered one before creating.
+            provider = (
+                self.request.db.query(GitHubProvider)
+                .filter(
+                    GitHubProvider.repository_name == form.repository.data,
+                    GitHubProvider.repository_owner == form.normalized_owner,
+                    GitHubProvider.workflow_filename == form.workflow_filename.data,
+                )
+                .one_or_none()
+            )
+            if provider is None:
+                provider = GitHubProvider(
+                    repository_name=form.repository.data,
+                    repository_owner=form.normalized_owner,
+                    repository_owner_id=form.owner_id,
+                    workflow_filename=form.workflow_filename.data,
+                )
+
+                self.request.db.add(provider)
+
+            # Each project has a unique set of OIDC providers; the same
+            # provider can't be registered to the project more than once.
+            if provider in self.project.oidc_providers:
+                self.request.session.flash(
+                    f"{provider} is already registered with {self.project.name}",
+                    queue="error",
+                )
+                return response
+
+            for user in self.project.users:
+                send_oidc_provider_added_email(
+                    self.request,
+                    user,
+                    project_name=self.project.name,
+                    provider=provider,
+                )
+
+            self.project.oidc_providers.append(provider)
+
+            self.project.record_event(
+                tag="project:oidc:provider-added",
+                ip_address=self.request.remote_addr,
+                additional={
+                    "provider": provider.provider_name,
+                    "id": str(provider.id),
+                    "specifier": str(provider),
+                },
+            )
+
+            self.request.session.flash(
+                f"Added {provider} to {self.project.name}",
+                queue="success",
+            )
+
+            self.metrics.increment(
+                "warehouse.oidc.add_provider.ok", tags=["provider:GitHub"]
+            )
+
+        return response
+
+    @view_config(request_method="POST", request_param=DeleteProviderForm.__params__)
+    def delete_oidc_provider(self):
+        if not self.oidc_enabled:
+            raise HTTPNotFound
+
+        self.metrics.increment("warehouse.oidc.delete_provider.attempt")
+
+        if self.request.flags.enabled(AdminFlagValue.DISALLOW_OIDC):
+            self.request.session.flash(
+                (
+                    "OpenID Connect is temporarily disabled. "
+                    "See https://pypi.org/help#admin-intervention for details."
+                ),
+                queue="error",
+            )
+            return self.default_response
+
+        form = DeleteProviderForm(self.request.POST)
+
+        if form.validate():
+            provider = self.request.db.query(OIDCProvider).get(form.provider_id.data)
+
+            # provider will be `None` here if someone manually futzes with the form.
+            if provider is None or provider not in self.project.oidc_providers:
+                self.request.session.flash(
+                    "Invalid publisher for project",
+                    queue="error",
+                )
+                return self.default_response
+
+            for user in self.project.users:
+                send_oidc_provider_removed_email(
+                    self.request,
+                    user,
+                    project_name=self.project.name,
+                    provider=provider,
+                )
+
+            # NOTE: We remove the provider from the project, but we don't actually
+            # delete the provider model itself (since it might be associated
+            # with other projects).
+            self.project.oidc_providers.remove(provider)
+
+            self.project.record_event(
+                tag="project:oidc:provider-removed",
+                ip_address=self.request.remote_addr,
+                additional={
+                    "provider": provider.provider_name,
+                    "id": str(provider.id),
+                    "specifier": str(provider),
+                },
+            )
+
+            self.request.session.flash(
+                f"Removed {provider} from {self.project.name}", queue="success"
+            )
+
+            self.metrics.increment(
+                "warehouse.oidc.delete_provider.ok",
+                tags=[f"provider:{provider.provider_name}"],
+            )
+
+        return self.default_response
 
 
 def get_user_role_in_project(project, user, request):
@@ -1721,13 +2874,7 @@ def change_project_role(project, request, _form_class=ChangeRoleForm):
                     },
                 )
 
-                owner_roles = (
-                    request.db.query(Role)
-                    .filter(Role.project == project)
-                    .filter(Role.role_name == "Owner")
-                    .all()
-                )
-                owner_users = {owner.user for owner in owner_roles}
+                owner_users = set(project_owners(request, project))
                 # Don't send owner notification email to new user
                 # if they are now an owner
                 owner_users.discard(role.user)
@@ -1798,13 +2945,7 @@ def delete_project_role(project, request):
                 },
             )
 
-            owner_roles = (
-                request.db.query(Role)
-                .filter(Role.project == project)
-                .filter(Role.role_name == "Owner")
-                .all()
-            )
-            owner_users = {owner.user for owner in owner_roles}
+            owner_users = set(project_owners(request, project))
             # Don't send owner notification email to new user
             # if they are now an owner
             owner_users.discard(role.user)
@@ -1844,10 +2985,10 @@ def manage_project_history(project, request):
         raise HTTPBadRequest("'page' must be an integer.")
 
     events_query = (
-        request.db.query(ProjectEvent)
-        .join(ProjectEvent.project)
-        .filter(ProjectEvent.project_id == project.id)
-        .order_by(ProjectEvent.time.desc())
+        request.db.query(Project.Event)
+        .join(Project.Event.source)
+        .filter(Project.Event.source_id == project.id)
+        .order_by(Project.Event.time.desc())
     )
 
     events = SQLAlchemyORMPage(

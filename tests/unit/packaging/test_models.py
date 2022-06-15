@@ -15,10 +15,10 @@ from collections import OrderedDict
 import pretend
 import pytest
 
+from pyramid.authorization import Allow
 from pyramid.location import lineage
-from pyramid.security import Allow
 
-from warehouse.packaging.models import Dependency, DependencyKind, File, ProjectFactory
+from warehouse.packaging.models import File, ProjectFactory, ReleaseURL
 
 from ...common.db.packaging import (
     FileFactory as DBFileFactory,
@@ -118,14 +118,14 @@ class TestProject:
             (Allow, "group:moderators", "moderator"),
         ] + sorted(
             [
-                (Allow, str(owner1.user.id), ["manage:project", "upload"]),
-                (Allow, str(owner2.user.id), ["manage:project", "upload"]),
+                (Allow, f"user:{owner1.user.id}", ["manage:project", "upload"]),
+                (Allow, f"user:{owner2.user.id}", ["manage:project", "upload"]),
             ],
             key=lambda x: x[1],
         ) + sorted(
             [
-                (Allow, str(maintainer1.user.id), ["upload"]),
-                (Allow, str(maintainer2.user.id), ["upload"]),
+                (Allow, f"user:{maintainer1.user.id}", ["upload"]),
+                (Allow, f"user:{maintainer2.user.id}", ["upload"]),
             ],
             key=lambda x: x[1],
         )
@@ -252,17 +252,34 @@ class TestRelease:
                     ]
                 ),
             ),
-            # ignore invalid links
+            # similar spellings of homepage/download label doesn't duplicate urls
             (
-                None,
+                "https://example.com/home/",
+                "https://example.com/download/",
+                [
+                    "homepage, https://example.com/home/",
+                    "download-URL ,https://example.com/download/",
+                ],
+                OrderedDict(
+                    [
+                        ("Homepage", "https://example.com/home/"),
+                        ("Download", "https://example.com/download/"),
+                    ]
+                ),
+            ),
+            # the duplicate removal only happens if the urls are equal too!
+            (
+                "https://example.com/home1/",
                 None,
                 [
-                    " ,https://example.com/home/",
-                    ",https://example.com/home/",
-                    "https://example.com/home/",
-                    "Download,https://example.com/download/",
+                    "homepage, https://example.com/home2/",
                 ],
-                OrderedDict([("Download", "https://example.com/download/")]),
+                OrderedDict(
+                    [
+                        ("Homepage", "https://example.com/home1/"),
+                        ("homepage", "https://example.com/home2/"),
+                    ]
+                ),
             ),
         ],
     )
@@ -272,11 +289,12 @@ class TestRelease:
         )
 
         for urlspec in project_urls:
+            label, _, url = urlspec.partition(",")
             db_session.add(
-                Dependency(
+                ReleaseURL(
                     release=release,
-                    kind=DependencyKind.project_url.value,
-                    specifier=urlspec,
+                    name=label.strip(),
+                    url=url.strip(),
                 )
             )
 
@@ -308,14 +326,14 @@ class TestRelease:
             (Allow, "group:moderators", "moderator"),
         ] + sorted(
             [
-                (Allow, str(owner1.user.id), ["manage:project", "upload"]),
-                (Allow, str(owner2.user.id), ["manage:project", "upload"]),
+                (Allow, f"user:{owner1.user.id}", ["manage:project", "upload"]),
+                (Allow, f"user:{owner2.user.id}", ["manage:project", "upload"]),
             ],
             key=lambda x: x[1],
         ) + sorted(
             [
-                (Allow, str(maintainer1.user.id), ["upload"]),
-                (Allow, str(maintainer2.user.id), ["upload"]),
+                (Allow, f"user:{maintainer1.user.id}", ["upload"]),
+                (Allow, f"user:{maintainer2.user.id}", ["upload"]),
             ],
             key=lambda x: x[1],
         )

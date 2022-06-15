@@ -18,7 +18,7 @@ from urllib.parse import urlparse
 import packaging.utils
 
 from citext import CIText
-from pyramid.security import Allow
+from pyramid.authorization import Allow
 from pyramid.threadlocal import get_current_request
 from sqlalchemy import (
     BigInteger,
@@ -39,11 +39,12 @@ from sqlalchemy import (
     orm,
     sql,
 )
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.ext.associationproxy import association_proxy
-from sqlalchemy.ext.declarative import declared_attr
+from sqlalchemy.ext.declarative import declared_attr  # type: ignore
 from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm import validates
+from sqlalchemy.orm.collections import attribute_mapped_collection
 from sqlalchemy.orm.exc import MultipleResultsFound, NoResultFound
 from sqlalchemy.sql import expression
 from trove_classifiers import sorted_classifiers
@@ -51,6 +52,7 @@ from trove_classifiers import sorted_classifiers
 from warehouse import db
 from warehouse.accounts.models import User
 from warehouse.classifiers.models import Classifier
+from warehouse.events.models import HasEvents
 from warehouse.integrations.vulnerabilities.models import VulnerabilityRecord
 from warehouse.sitemap.models import SitemapMixin
 from warehouse.utils import dotted_navigator
@@ -105,11 +107,14 @@ class RoleInvitation(db.Model):
     )
     token = Column(Text, nullable=False)
     user_id = Column(
-        ForeignKey("users.id", onupdate="CASCADE", ondelete="CASCADE"), nullable=False
+        ForeignKey("users.id", onupdate="CASCADE", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     project_id = Column(
         ForeignKey("projects.id", onupdate="CASCADE", ondelete="CASCADE"),
         nullable=False,
+        index=True,
     )
 
     user = orm.relationship(User, lazy=False)
@@ -131,7 +136,18 @@ class ProjectFactory:
             raise KeyError from None
 
 
-class Project(SitemapMixin, db.Model):
+class TwoFactorRequireable:
+    # Project owner requires 2FA for this project
+    owners_require_2fa = Column(Boolean, nullable=False, server_default=sql.false())
+    # PyPI requires 2FA for this project
+    pypi_mandates_2fa = Column(Boolean, nullable=False, server_default=sql.false())
+
+    @hybrid_property
+    def two_factor_required(self):
+        return self.owners_require_2fa | self.pypi_mandates_2fa
+
+
+class Project(SitemapMixin, TwoFactorRequireable, HasEvents, db.Model):
 
     __tablename__ = "projects"
     __table_args__ = (
@@ -159,18 +175,14 @@ class Project(SitemapMixin, db.Model):
 
     total_size = Column(BigInteger, server_default=sql.text("0"))
 
-    users = orm.relationship(User, secondary=Role.__table__, backref="projects")
+    users = orm.relationship(User, secondary=Role.__table__, backref="projects")  # type: ignore # noqa
 
     releases = orm.relationship(
         "Release",
         backref="project",
         cascade="all, delete-orphan",
-        order_by=lambda: Release._pypi_ordering.desc(),
+        order_by=lambda: Release._pypi_ordering.desc(),  # type: ignore
         passive_deletes=True,
-    )
-
-    events = orm.relationship(
-        "ProjectEvent", backref="project", cascade="all, delete-orphan", lazy=True
     )
 
     def __getitem__(self, version):
@@ -220,20 +232,12 @@ class Project(SitemapMixin, db.Model):
             query.all(), key=lambda x: ["Owner", "Maintainer"].index(x.role_name)
         ):
             if role.role_name == "Owner":
-                acls.append((Allow, str(role.user.id), ["manage:project", "upload"]))
+                acls.append(
+                    (Allow, f"user:{role.user.id}", ["manage:project", "upload"])
+                )
             else:
-                acls.append((Allow, str(role.user.id), ["upload"]))
+                acls.append((Allow, f"user:{role.user.id}", ["upload"]))
         return acls
-
-    def record_event(self, *, tag, ip_address, additional=None):
-        session = orm.object_session(self)
-        event = ProjectEvent(
-            project=self, tag=tag, ip_address=ip_address, additional=additional
-        )
-        session.add(event)
-        session.flush()
-
-        return event
 
     @property
     def documentation_url(self):
@@ -270,22 +274,6 @@ class Project(SitemapMixin, db.Model):
         )
 
 
-class ProjectEvent(db.Model):
-    __tablename__ = "project_events"
-
-    project_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey(
-            "projects.id", deferrable=True, initially="DEFERRED", ondelete="CASCADE"
-        ),
-        nullable=False,
-    )
-    tag = Column(String, nullable=False)
-    time = Column(DateTime, nullable=False, server_default=sql.func.now())
-    ip_address = Column(String, nullable=False)
-    additional = Column(JSONB, nullable=True)
-
-
 class DependencyKind(enum.IntEnum):
 
     requires = 1
@@ -295,10 +283,6 @@ class DependencyKind(enum.IntEnum):
     provides_dist = 5
     obsoletes_dist = 6
     requires_external = 7
-
-    # TODO: Move project URLs into their own table, since they are not actually
-    #       a "dependency".
-    project_url = 8
 
 
 class Dependency(db.Model):
@@ -335,6 +319,28 @@ class Description(db.Model):
     raw = Column(Text, nullable=False)
     html = Column(Text, nullable=False)
     rendered_by = Column(Text, nullable=False)
+
+
+class ReleaseURL(db.Model):
+
+    __tablename__ = "release_urls"
+    __table_args__ = (
+        UniqueConstraint("release_id", "name"),
+        CheckConstraint(
+            "char_length(name) BETWEEN 1 AND 32",
+            name="release_urls_valid_name",
+        ),
+    )
+    __repr__ = make_repr("name", "url")
+
+    release_id = Column(
+        ForeignKey("releases.id", onupdate="CASCADE", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+
+    name = Column(String(32), nullable=False)
+    url = Column(Text, nullable=False)
 
 
 class Release(db.Model):
@@ -380,6 +386,7 @@ class Release(db.Model):
     description_id = Column(
         ForeignKey("release_descriptions.id", onupdate="CASCADE", ondelete="CASCADE"),
         nullable=False,
+        index=True,
     )
     description = orm.relationship(
         "Description",
@@ -400,7 +407,7 @@ class Release(db.Model):
     _classifiers = orm.relationship(
         Classifier,
         backref="project_releases",
-        secondary=lambda: release_classifiers,
+        secondary=lambda: release_classifiers,  # type: ignore
         order_by=expression.case(
             {c: i for i, c in enumerate(sorted_classifiers)},
             value=Classifier.classifier,
@@ -409,12 +416,26 @@ class Release(db.Model):
     )
     classifiers = association_proxy("_classifiers", "classifier")
 
+    _project_urls = orm.relationship(
+        ReleaseURL,
+        backref="release",
+        collection_class=attribute_mapped_collection("name"),
+        cascade="all, delete-orphan",
+        order_by=lambda: ReleaseURL.name.asc(),
+        passive_deletes=True,
+    )
+    project_urls = association_proxy(
+        "_project_urls",
+        "url",
+        creator=lambda k, v: ReleaseURL(name=k, url=v),  # type: ignore
+    )
+
     files = orm.relationship(
         "File",
         backref="release",
         cascade="all, delete-orphan",
         lazy="dynamic",
-        order_by=lambda: File.filename,
+        order_by=lambda: File.filename,  # type: ignore
         passive_deletes=True,
     )
 
@@ -453,9 +474,6 @@ class Release(db.Model):
     _requires_external = _dependency_relation(DependencyKind.requires_external)
     requires_external = association_proxy("_requires_external", "specifier")
 
-    _project_urls = _dependency_relation(DependencyKind.project_url)
-    project_urls = association_proxy("_project_urls", "specifier")
-
     uploader_id = Column(
         ForeignKey("users.id", onupdate="CASCADE", ondelete="SET NULL"),
         nullable=True,
@@ -473,12 +491,17 @@ class Release(db.Model):
         if self.download_url:
             _urls["Download"] = self.download_url
 
-        for urlspec in self.project_urls:
-            name, _, url = urlspec.partition(",")
-            name = name.strip()
-            url = url.strip()
-            if name and url:
-                _urls[name] = url
+        for name, url in self.project_urls.items():
+            # avoid duplicating homepage/download links in case the same
+            # url is specified in the pkginfo twice (in the Home-page
+            # or Download-URL field and again in the Project-URL fields)
+            comp_name = name.casefold().replace("-", "").replace("_", "")
+            if comp_name == "homepage" and url == _urls.get("Homepage"):
+                continue
+            if comp_name == "downloadurl" and url == _urls.get("Download"):
+                continue
+
+            _urls[name] = url
 
         return _urls
 
@@ -569,7 +592,7 @@ class File(db.Model):
     def pgp_path(self):
         return self.path + ".asc"
 
-    @pgp_path.expression
+    @pgp_path.expression  # type: ignore
     def pgp_path(self):
         return func.concat(self.path, ".asc")
 

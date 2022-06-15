@@ -49,6 +49,7 @@ from warehouse.packaging.models import (
     Role,
 )
 from warehouse.packaging.tasks import update_bigquery_release_files
+from warehouse.utils.security_policy import AuthenticationMethod
 
 from ...common.db.accounts import EmailFactory, UserFactory
 from ...common.db.classifiers import ClassifierFactory
@@ -99,11 +100,12 @@ class TestExcWithMessage:
 
 
 class TestValidation:
-    @pytest.mark.parametrize("version", ["1.0", "30a1", "1!1", "1.0-1"])
+    @pytest.mark.parametrize("version", ["1.0", "30a1", "1!1", "1.0-1", "v1.0"])
     def test_validates_valid_pep440_version(self, version):
         form, field = pretend.stub(), pretend.stub(data=version)
         legacy._validate_pep440_version(form, field)
 
+    @pytest.mark.filterwarnings("ignore:Creating a LegacyVersion.*:DeprecationWarning")
     @pytest.mark.parametrize("version", ["dog", "1.0.dev.a1", "1.0+local"])
     def test_validates_invalid_pep440_version(self, version):
         form, field = pretend.stub(), pretend.stub(data=version)
@@ -224,7 +226,11 @@ class TestValidation:
 
     @pytest.mark.parametrize(
         "project_url",
-        ["Home, https://pypi.python.org/", ("A" * 32) + ", https://example.com/"],
+        [
+            "Home, https://pypi.python.org/",
+            "Home,https://pypi.python.org/",
+            ("A" * 32) + ", https://example.com/",
+        ],
     )
     def test_validate_project_url_valid(self, project_url):
         legacy._validate_project_url(project_url)
@@ -232,7 +238,6 @@ class TestValidation:
     @pytest.mark.parametrize(
         "project_url",
         [
-            "Home,https://pypi.python.org/",
             "https://pypi.python.org/",
             ", https://pypi.python.org/",
             "Home, ",
@@ -943,7 +948,11 @@ class TestFileUpload:
                     "md5_digest": "a fake md5 digest",
                     "summary": "A" * 513,
                 },
-                "'" + "A" * 513 + "' is an invalid value for Summary. "
+                "'"
+                + "A" * 30
+                + "..."
+                + "A" * 30
+                + "' is an invalid value for Summary. "
                 "Error: Field cannot be longer than 512 characters. "
                 "See "
                 "https://packaging.python.org/specifications/core-metadata"
@@ -988,6 +997,7 @@ class TestFileUpload:
             ),
         ],
     )
+    @pytest.mark.filterwarnings("ignore:Creating a LegacyVersion.*:DeprecationWarning")
     def test_fails_invalid_post_data(
         self, pyramid_config, db_request, post_data, message
     ):
@@ -1042,6 +1052,57 @@ class TestFileUpload:
             "See /the/help/url/ "
             "for more information."
         ).format(name)
+
+    @pytest.mark.parametrize(
+        "conflicting_name",
+        [
+            "toast1ng",
+            "toastlng",
+            "t0asting",
+            "toast-ing",
+            "toast.ing",
+            "toast_ing",
+        ],
+    )
+    def test_fails_with_ultranormalized_names(
+        self, pyramid_config, db_request, conflicting_name
+    ):
+        pyramid_config.testing_securitypolicy(userid=1)
+        user = UserFactory.create()
+        EmailFactory.create(user=user)
+        ProjectFactory.create(name="toasting")
+        db_request.user = user
+        db_request.db.flush()
+
+        db_request.POST = MultiDict(
+            {
+                "metadata_version": "1.2",
+                "name": conflicting_name,
+                "version": "1.0",
+                "filetype": "sdist",
+                "md5_digest": "a fake md5 digest",
+                "content": pretend.stub(
+                    filename=f"{conflicting_name}-1.0.tar.gz",
+                    file=io.BytesIO(_TAR_GZ_PKG_TESTDATA),
+                    type="application/tar",
+                ),
+            }
+        )
+
+        db_request.help_url = pretend.call_recorder(lambda **kw: "/the/help/url/")
+
+        with pytest.raises(HTTPBadRequest) as excinfo:
+            legacy.file_upload(db_request)
+
+        resp = excinfo.value
+
+        assert db_request.help_url.calls == [pretend.call(_anchor="project-name")]
+
+        assert resp.status_code == 400
+        assert resp.status == (
+            "400 The name {!r} is too similar to an existing project. "
+            "See /the/help/url/ for more information."
+        ).format(conflicting_name)
 
     @pytest.mark.parametrize(
         ("description_content_type", "description", "message"),
@@ -2548,6 +2609,48 @@ class TestFileUpload:
             "See /the/help/url/ for more information."
         ).format(user2.username, project.name)
 
+    def test_upload_succeeds_with_2fa_enabled(
+        self, pyramid_config, db_request, metrics, monkeypatch
+    ):
+        pyramid_config.testing_securitypolicy(userid=1)
+
+        user = UserFactory.create(totp_secret=b"secret")
+        EmailFactory.create(user=user)
+        project = ProjectFactory.create()
+        RoleFactory.create(user=user, project=project)
+
+        db_request.user = user
+        db_request.user_agent = "warehouse-tests/6.6.6"
+        db_request.POST = MultiDict(
+            {
+                "metadata_version": "1.2",
+                "name": project.name,
+                "version": "1.0.0",
+                "summary": "This is my summary!",
+                "filetype": "sdist",
+                "md5_digest": _TAR_GZ_PKG_MD5,
+                "content": pretend.stub(
+                    filename="{}-{}.tar.gz".format(project.name, "1.0.0"),
+                    file=io.BytesIO(_TAR_GZ_PKG_TESTDATA),
+                    type="application/tar",
+                ),
+            }
+        )
+        db_request.authentication_method = AuthenticationMethod.BASIC_AUTH
+
+        send_email = pretend.call_recorder(lambda *a, **kw: None)
+        monkeypatch.setattr(legacy, "send_basic_auth_with_two_factor_email", send_email)
+
+        storage_service = pretend.stub(store=lambda path, filepath, meta: None)
+        db_request.find_service = lambda svc, name=None, context=None: {
+            IFileStorage: storage_service,
+            IMetricsService: metrics,
+        }.get(svc)
+
+        legacy.file_upload(db_request)
+
+        assert send_email.calls == [pretend.call(db_request, user)]
+
     @pytest.mark.parametrize(
         "plat",
         [
@@ -2573,6 +2676,7 @@ class TestFileUpload:
             "manylinux_2_17_ppc64",
             "manylinux_2_17_ppc64le",
             "manylinux_3_0_s390x",
+            "musllinux_1_1_x86_64",
             "macosx_10_6_intel",
             "macosx_10_13_x86_64",
             "macosx_11_0_x86_64",
@@ -2808,7 +2912,7 @@ class TestFileUpload:
             "linux_x86_64",
             "linux_x86_64.win32",
             "macosx_9_2_x86_64",
-            "macosx_12_2_arm64",
+            "macosx_13_2_arm64",
             "macosx_10_15_amd64",
         ],
     )
@@ -2910,7 +3014,17 @@ class TestFileUpload:
 
         assert release.uploaded_via == "warehouse-tests/6.6.6"
 
-    def test_upload_succeeds_creates_release(self, pyramid_config, db_request, metrics):
+    # here
+    @pytest.mark.parametrize(
+        "version, expected_version",
+        [
+            ("1.0", "1.0"),
+            ("v1.0", "1.0"),
+        ],
+    )
+    def test_upload_succeeds_creates_release(
+        self, pyramid_config, db_request, metrics, version, expected_version
+    ):
         pyramid_config.testing_securitypolicy(userid=1)
 
         user = UserFactory.create()
@@ -2929,7 +3043,7 @@ class TestFileUpload:
             {
                 "metadata_version": "1.2",
                 "name": project.name,
-                "version": "1.0",
+                "version": version,
                 "summary": "This is my summary!",
                 "filetype": "sdist",
                 "md5_digest": _TAR_GZ_PKG_MD5,
@@ -2965,7 +3079,9 @@ class TestFileUpload:
         # Ensure that a Release object has been created.
         release = (
             db_request.db.query(Release)
-            .filter((Release.project == project) & (Release.version == "1.0"))
+            .filter(
+                (Release.project == project) & (Release.version == expected_version)
+            )
             .one()
         )
         assert release.summary == "This is my summary!"
@@ -2974,9 +3090,10 @@ class TestFileUpload:
             "Programming Language :: Python",
         ]
         assert set(release.requires_dist) == {"foo", "bar (>1.0)"}
-        assert set(release.project_urls) == {"Test, https://example.com/"}
+        assert release.project_urls == {"Test": "https://example.com/"}
         assert set(release.requires_external) == {"Cheese (>1.0)"}
         assert set(release.provides) == {"testing"}
+        assert release.version == expected_version
         assert release.canonical_version == "1"
         assert release.uploaded_via == "warehouse-tests/6.6.6"
 

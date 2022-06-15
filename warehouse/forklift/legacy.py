@@ -47,6 +47,7 @@ from trove_classifiers import classifiers, deprecated_classifiers
 from warehouse import forms
 from warehouse.admin.flags import AdminFlagValue
 from warehouse.classifiers.models import Classifier
+from warehouse.email import send_basic_auth_with_two_factor_email
 from warehouse.metrics import IMetricsService
 from warehouse.packaging.interfaces import IFileStorage
 from warehouse.packaging.models import (
@@ -63,6 +64,7 @@ from warehouse.packaging.models import (
 )
 from warehouse.packaging.tasks import update_bigquery_release_files
 from warehouse.utils import http, readme
+from warehouse.utils.security_policy import AuthenticationMethod
 
 ONE_MB = 1 * 1024 * 1024
 ONE_GB = 1 * 1024 * 1024 * 1024
@@ -107,6 +109,7 @@ STDLIB_PROHIBITED = {
 _allowed_platforms = {
     "any",
     "win32",
+    "win_arm64",
     "win_amd64",
     "win_ia64",
     "manylinux1_x86_64",
@@ -141,19 +144,21 @@ _macosx_arches = {
 _macosx_major_versions = {
     "10",
     "11",
+    "12",
 }
 
-# manylinux pep600 is a little more complicated:
-_manylinux_platform_re = re.compile(r"manylinux_(\d+)_(\d+)_(?P<arch>.*)")
-_manylinux_arches = {
+# manylinux pep600 and musllinux pep656 are a little more complicated:
+_linux_platform_re = re.compile(r"(?P<libc>(many|musl))linux_(\d+)_(\d+)_(?P<arch>.*)")
+_jointlinux_arches = {
     "x86_64",
     "i686",
     "aarch64",
     "armv7l",
-    "ppc64",
     "ppc64le",
     "s390x",
 }
+_manylinux_arches = _jointlinux_arches | {"ppc64"}
+_musllinux_arches = _jointlinux_arches
 
 
 # Actual checking code;
@@ -167,9 +172,11 @@ def _valid_platform_tag(platform_tag):
         and m.group("arch") in _macosx_arches
     ):
         return True
-    m = _manylinux_platform_re.match(platform_tag)
-    if m and m.group("arch") in _manylinux_arches:
-        return True
+    m = _linux_platform_re.match(platform_tag)
+    if m and m.group("libc") == "musl":
+        return m.group("arch") in _musllinux_arches
+    if m and m.group("libc") == "many":
+        return m.group("arch") in _manylinux_arches
     return False
 
 
@@ -316,7 +323,7 @@ def _validate_requires_external_list(form, field):
 
 def _validate_project_url(value):
     try:
-        label, url = value.split(", ", 1)
+        label, url = (x.strip() for x in value.split(",", maxsplit=1))
     except ValueError:
         raise wtforms.validators.ValidationError(
             "Use both a label and an URL."
@@ -864,7 +871,12 @@ def file_upload(request):
             if field.description and isinstance(field, wtforms.StringField):
                 error_message = (
                     "{value!r} is an invalid value for {field}. ".format(
-                        value=field.data, field=field.description
+                        value=(
+                            field.data[:30] + "..." + field.data[-30:]
+                            if field.data and len(field.data) > 60
+                            else field.data or ""
+                        ),
+                        field=field.description,
                     )
                     + "Error: {} ".format(form.errors[field_name][0])
                     + "See "
@@ -908,18 +920,38 @@ def file_upload(request):
                 ).format(projecthelp=request.help_url(_anchor="admin-intervention")),
             ) from None
 
-        # Before we create the project, we're going to check our prohibited names to
-        # see if this project is even allowed to be registered. If it is not,
+        # Before we create the project, we're going to check our prohibited
+        # names to see if this project name prohibited, or if the project name
+        # is a close approximation of an existing project name. If it is,
         # then we're going to deny the request to create this project.
-        if request.db.query(
+        _prohibited_name = request.db.query(
             exists().where(
                 ProhibitedProjectName.name == func.normalize_pep426_name(form.name.data)
             )
-        ).scalar():
+        ).scalar()
+        if _prohibited_name:
             raise _exc_with_message(
                 HTTPBadRequest,
                 (
                     "The name {name!r} isn't allowed. "
+                    "See {projecthelp} for more information."
+                ).format(
+                    name=form.name.data,
+                    projecthelp=request.help_url(_anchor="project-name"),
+                ),
+            ) from None
+
+        _ultranormalize_collision = request.db.query(
+            exists().where(
+                func.ultranormalize_name(Project.name)
+                == func.ultranormalize_name(form.name.data)
+            )
+        ).scalar()
+        if _ultranormalize_collision:
+            raise _exc_with_message(
+                HTTPBadRequest,
+                (
+                    "The name {name!r} is too similar to an existing project. "
                     "See {projecthelp} for more information."
                 ).format(
                     name=form.name.data,
@@ -1003,6 +1035,14 @@ def file_upload(request):
         )
         raise _exc_with_message(HTTPForbidden, msg)
 
+    # Check if the user has 2FA and used basic auth
+    if (
+        request.authentication_method == AuthenticationMethod.BASIC_AUTH
+        and request.user.has_two_factor
+    ):
+        # Eventually, raise here to disable basic auth with 2FA enabled
+        send_basic_auth_with_two_factor_email(request, request.user)
+
     # Update name if it differs but is still equivalent. We don't need to check if
     # they are equivalent when normalized because that's already been done when we
     # queried for the project.
@@ -1083,6 +1123,12 @@ def file_upload(request):
                 request.db.add(missing_classifier)
                 release_classifiers.append(missing_classifier)
 
+        # Parse the Project URLs structure into a key/value dict
+        project_urls = {
+            name.strip(): url.strip()
+            for name, _, url in (us.partition(",") for us in form.project_urls.data)
+        }
+
         release = Release(
             project=project,
             _classifiers=release_classifiers,
@@ -1097,10 +1143,12 @@ def file_upload(request):
                         "provides_dist": DependencyKind.provides_dist,
                         "obsoletes_dist": DependencyKind.obsoletes_dist,
                         "requires_external": DependencyKind.requires_external,
-                        "project_urls": DependencyKind.project_url,
                     },
                 )
             ),
+            # This has the effect of removing any preceding v character
+            # https://www.python.org/dev/peps/pep-0440/#preceding-v-character
+            version=str(packaging.version.parse(form.version.data)),
             canonical_version=canonical_version,
             description=Description(
                 content_type=form.description_content_type.data,
@@ -1108,12 +1156,12 @@ def file_upload(request):
                 html=rendered or "",
                 rendered_by=readme.renderer_version(),
             ),
+            project_urls=project_urls,
             **{
                 k: getattr(form, k).data
                 for k in {
                     # This is a list of all the fields in the form that we
                     # should pull off and insert into our new release.
-                    "version",
                     "summary",
                     "license",
                     "author",

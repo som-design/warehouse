@@ -51,9 +51,7 @@ def includeme(config):
     config.add_template_view(
         "sponsors",
         "/sponsors/",
-        # Use the full resource path here to make it able to be overridden by
-        # pypi-theme.
-        "warehouse:templates/pages/sponsors.html",
+        "pages/sponsors.html",
         view_kw={"has_translations": True},
     )
 
@@ -128,6 +126,7 @@ def includeme(config):
     )
 
     # Accounts
+    config.add_redirect("/u/{username}/", "/user/{username}/", domain=warehouse)
     config.add_route(
         "accounts.profile",
         "/user/{username}/",
@@ -167,12 +166,20 @@ def includeme(config):
         "accounts.verify-email", "/account/verify-email/", domain=warehouse
     )
     config.add_route(
+        "accounts.verify-organization-role",
+        "/account/verify-organization-role/",
+        domain=warehouse,
+    )
+    config.add_route(
         "accounts.verify-project-role",
         "/account/verify-project-role/",
         domain=warehouse,
     )
     # Management (views for logged-in users)
     config.add_route("manage.account", "/manage/account/", domain=warehouse)
+    config.add_route(
+        "manage.account.two-factor", "/manage/account/two-factor/", domain=warehouse
+    )
     config.add_route(
         "manage.account.totp-provision",
         "/manage/account/totp-provision",
@@ -213,11 +220,59 @@ def includeme(config):
         "/manage/account/recovery-codes/regenerate",
         domain=warehouse,
     )
+    config.add_route(
+        "manage.account.recovery-codes.burn",
+        "/manage/account/recovery-codes/burn",
+        domain=warehouse,
+    )
     config.add_route("manage.account.token", "/manage/account/token/", domain=warehouse)
+    config.add_route("manage.organizations", "/manage/organizations/", domain=warehouse)
+    config.add_route(
+        "manage.organization.settings",
+        "/manage/organization/{organization_name}/settings/",
+        factory="warehouse.organizations.models:OrganizationFactory",
+        traverse="/{organization_name}",
+        domain=warehouse,
+    )
+    config.add_route(
+        "manage.organization.roles",
+        "/manage/organization/{organization_name}/people/",
+        factory="warehouse.organizations.models:OrganizationFactory",
+        traverse="/{organization_name}",
+        domain=warehouse,
+    )
+    config.add_route(
+        "manage.organization.revoke_invite",
+        "/manage/organization/{organization_name}/people/revoke_invite/",
+        factory="warehouse.organizations.models:OrganizationFactory",
+        traverse="/{organization_name}",
+        domain=warehouse,
+    )
+    config.add_route(
+        "manage.organization.change_role",
+        "/manage/organization/{organization_name}/people/change/",
+        factory="warehouse.organizations.models:OrganizationFactory",
+        traverse="/{organization_name}",
+        domain=warehouse,
+    )
+    config.add_route(
+        "manage.organization.delete_role",
+        "/manage/organization/{organization_name}/people/delete/",
+        factory="warehouse.organizations.models:OrganizationFactory",
+        traverse="/{organization_name}",
+        domain=warehouse,
+    )
     config.add_route("manage.projects", "/manage/projects/", domain=warehouse)
     config.add_route(
         "manage.project.settings",
         "/manage/project/{project_name}/settings/",
+        factory="warehouse.packaging.models:ProjectFactory",
+        traverse="/{project_name}",
+        domain=warehouse,
+    )
+    config.add_route(
+        "manage.project.settings.publishing",
+        "/manage/project/{project_name}/settings/publishing/",
         factory="warehouse.packaging.models:ProjectFactory",
         traverse="/{project_name}",
         domain=warehouse,

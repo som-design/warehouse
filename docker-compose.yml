@@ -1,6 +1,7 @@
-version: '3'
+version: '3.9'
 
 volumes:
+  simple:
   packages:
   sponsorlogos:
   vault:
@@ -28,24 +29,27 @@ services:
     ports:
       # 5432 may already in use by another PostgreSQL on host
       - "5433:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "postgres"]
 
   redis:
     image: redis:4.0
 
   localstack:
-    image: localstack/localstack:0.8.7
+    image: localstack/localstack:0.12.19.1
     environment:
       SERVICES: "sqs"
       HOSTNAME: "localstack"
       HOSTNAME_EXTERNAL: "localstack"
       DEFAULT_REGION: "us-east-2"
     ports:
-      - "4576:4576"
+      - "4566:4566"
 
   elasticsearch:
-    image: docker.elastic.co/elasticsearch/elasticsearch:6.8.7
+    image: elasticsearch:7.10.1
     environment:
       - xpack.security.enabled=false
+      - discovery.type=single-node
     ulimits:
       nofile:
         soft: 65536
@@ -57,6 +61,7 @@ services:
       - "9000:9000"
     environment:
       CAMO_KEY: "insecurecamokey"
+      PORT: 9000
 
   web:
     build:
@@ -64,10 +69,6 @@ services:
       args:
         DEVEL: "yes"
         IPYTHON: "no"
-        # Uncomment the line below and add the private repo URL if you're
-        # working on pypi-theme, this is a private repository due to the fact
-        # that other people's IP is contained in it.
-        #THEME_REPO:
     command: gunicorn --reload -b 0.0.0.0:8000 warehouse.wsgi:application
     env_file: dev/environment
     volumes:
@@ -87,9 +88,18 @@ services:
       - .coveragerc:/opt/warehouse/src/.coveragerc:z
       - packages:/var/opt/warehouse/packages
       - sponsorlogos:/var/opt/warehouse/sponsorlogos
+      - simple:/var/opt/warehouse/simple
       - ./bin:/opt/warehouse/src/bin:z
+      - ./requirements:/opt/warehouse/src/requirements:z
     ports:
-      - "80:8000"
+      - "${WEB_PORT:-80}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_started
+      redis:
+        condition: service_started
 
   files:
     build:
@@ -99,6 +109,7 @@ services:
     volumes:
       - packages:/var/opt/warehouse/packages
       - sponsorlogos:/var/opt/warehouse/sponsorlogos
+      - simple:/var/opt/warehouse/simple
     ports:
       - "9001:9001"
 
@@ -114,6 +125,7 @@ services:
     environment:
       C_FORCE_ROOT: "1"
       FILES_BACKEND: "warehouse.packaging.services.LocalFileStorage path=/var/opt/warehouse/packages/ url=http://files:9001/packages/{path}"
+      SIMPLE_BACKEND: "warehouse.packaging.services.LocalSimpleStorage path=/var/opt/warehouse/simple/ url=http://files:9001/simple/{path}"
 
   static:
     build:
@@ -128,14 +140,11 @@ services:
       - ./tests/frontend:/opt/warehouse/src/tests/frontend:z
       - ./bin:/opt/warehouse/src/bin:z
 
-  smtp:
-    build:
-      context: .
-    command: python /opt/warehouse/dev/smtp.py 0.0.0.0:2525
+  maildev:
+    image: maildev/maildev:2.0.2
     ports:
-      - "2525:2525"
-    volumes:
-      - ./dev/smtp.py:/opt/warehouse/dev/smtp.py
+      - "1080:1080"
+      - "1025:1025"
 
   notdatadog:
     build:

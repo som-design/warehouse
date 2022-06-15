@@ -20,7 +20,7 @@ from sqlalchemy.orm import joinedload
 from webob.multidict import MultiDict, NoVars
 
 from warehouse.accounts.interfaces import IUserService
-from warehouse.accounts.models import DisableReason
+from warehouse.accounts.models import DisableReason, ProhibitedUserName
 from warehouse.admin.views import users as views
 from warehouse.packaging.models import JournalEntry, Project
 
@@ -147,10 +147,55 @@ class TestUserDetail:
         assert resp.location == "/admin/users/{}/".format(user.id)
         assert user.name == "Jane Doe"
 
+    def test_updates_user_no_primary_email(self, db_request):
+        email = EmailFactory.create(primary=True)
+        user = UserFactory.create(emails=[email])
+        db_request.matchdict["user_id"] = str(user.id)
+        db_request.method = "POST"
+        db_request.POST["name"] = "Jane Doe"
+        db_request.POST["emails-0-email"] = email.email
+        # No primary = checkbox unchecked
+
+        db_request.POST = MultiDict(db_request.POST)
+        db_request.current_route_path = pretend.call_recorder(
+            lambda: "/admin/users/{}/".format(user.id)
+        )
+
+        resp = views.user_detail(db_request)
+
+        assert resp["form"].errors == {
+            "emails": ["There must be exactly one primary email"]
+        }
+
+    def test_updates_user_multiple_primary_emails(self, db_request):
+        email1 = EmailFactory.create(primary=True)
+        email2 = EmailFactory.create(primary=True)
+        user = UserFactory.create(emails=[email1, email2])
+        db_request.matchdict["user_id"] = str(user.id)
+        db_request.method = "POST"
+        db_request.POST["name"] = "Jane Doe"
+        db_request.POST["emails-0-email"] = email1.email
+        db_request.POST["emails-0-primary"] = "true"
+        db_request.POST["emails-1-email"] = email2.email
+        db_request.POST["emails-1-primary"] = "true"
+        # No primary = checkbox unchecked
+
+        db_request.POST = MultiDict(db_request.POST)
+        db_request.current_route_path = pretend.call_recorder(
+            lambda: "/admin/users/{}/".format(user.id)
+        )
+
+        resp = views.user_detail(db_request)
+
+        assert resp["form"].errors == {
+            "emails": ["There must be exactly one primary email"]
+        }
+
 
 class TestUserAddEmail:
-    def test_add_email(self, db_request):
-        user = UserFactory.create(emails=[])
+    def test_add_primary_email(self, db_request):
+        old_email = EmailFactory.create(email="old@bar.com", primary=True)
+        user = UserFactory.create(emails=[old_email])
         db_request.matchdict["user_id"] = str(user.id)
         db_request.method = "POST"
         db_request.POST["email"] = "foo@bar.com"
@@ -167,13 +212,39 @@ class TestUserAddEmail:
 
         assert resp.status_code == 303
         assert resp.location == "/admin/users/{}/".format(user.id)
-        assert len(user.emails) == 1
+        assert len(user.emails) == 2
 
-        email = user.emails[0]
+        emails = {e.email: e for e in user.emails}
 
-        assert email.email == "foo@bar.com"
-        assert email.primary
-        assert email.verified
+        assert not emails["old@bar.com"].primary
+        assert emails["foo@bar.com"].primary
+        assert emails["foo@bar.com"].verified
+
+    def test_add_non_primary_email(self, db_request):
+        old_email = EmailFactory.create(email="old@bar.com", primary=True)
+        user = UserFactory.create(emails=[old_email])
+        db_request.matchdict["user_id"] = str(user.id)
+        db_request.method = "POST"
+        db_request.POST["email"] = "foo@bar.com"
+        # No "primary" field
+        db_request.POST["verified"] = True
+        db_request.POST = MultiDict(db_request.POST)
+        db_request.route_path = pretend.call_recorder(
+            lambda *a, **kw: "/admin/users/{}/".format(user.id)
+        )
+
+        resp = views.user_add_email(db_request)
+
+        db_request.db.flush()
+
+        assert resp.status_code == 303
+        assert resp.location == "/admin/users/{}/".format(user.id)
+        assert len(user.emails) == 2
+
+        emails = {e.email: e for e in user.emails}
+
+        assert emails["old@bar.com"].primary
+        assert not emails["foo@bar.com"].primary
 
     def test_add_invalid(self, db_request):
         user = UserFactory.create(emails=[])
@@ -324,3 +395,60 @@ class TestUserResetPassword:
         ]
         assert result.status_code == 303
         assert result.location == "/foobar"
+
+
+class TestBulkAddProhibitedUserName:
+    def test_get(self):
+        request = pretend.stub(method="GET")
+
+        assert views.bulk_add_prohibited_user_names(request) == {}
+
+    def test_bulk_add(self, db_request):
+        db_request.user = UserFactory.create()
+        db_request.method = "POST"
+
+        already_existing_prohibition = ProhibitedUserName(
+            name="prohibition-already-exists",
+            prohibited_by=db_request.user,
+            comment="comment",
+        )
+        db_request.db.add(already_existing_prohibition)
+
+        already_existing_user = UserFactory.create(username="user-already-exists")
+        UserFactory.create(username="deleted-user")
+
+        user_names = [
+            already_existing_prohibition.name,
+            already_existing_user.username,
+            "doesnt-already-exist",
+        ]
+
+        db_request.POST["users"] = "\n".join(user_names)
+
+        db_request.session = pretend.stub(
+            flash=pretend.call_recorder(lambda *a, **kw: None)
+        )
+        db_request.route_path = lambda a: "/admin/prohibited_user_names/bulk"
+
+        result = views.bulk_add_prohibited_user_names(db_request)
+
+        assert db_request.session.flash.calls == [
+            pretend.call(
+                f"Prohibited {len(user_names)!r} users",
+                queue="success",
+            )
+        ]
+        assert result.status_code == 303
+        assert result.headers["Location"] == "/admin/prohibited_user_names/bulk"
+
+        for user_name in user_names:
+            prohibition = (
+                db_request.db.query(ProhibitedUserName)
+                .filter(ProhibitedUserName.name == user_name)
+                .one()
+            )
+
+            assert prohibition.name == user_name
+            assert prohibition.prohibited_by == db_request.user
+
+            assert db_request.db.query(User).filter(User.name == user_name).count() == 0

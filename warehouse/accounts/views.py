@@ -15,6 +15,8 @@ import hashlib
 import json
 import uuid
 
+import pytz
+
 from first import first
 from pyramid.httpexceptions import (
     HTTPMovedPermanently,
@@ -24,6 +26,7 @@ from pyramid.httpexceptions import (
 from pyramid.security import forget, remember
 from pyramid.view import view_config
 from sqlalchemy.orm.exc import NoResultFound
+from webauthn.helpers import bytes_to_base64url
 
 from warehouse.accounts import REDIRECT_FIELD_NAME
 from warehouse.accounts.forms import (
@@ -46,17 +49,25 @@ from warehouse.accounts.interfaces import (
     TokenMissing,
     TooManyEmailsAdded,
     TooManyFailedLogins,
+    TooManyPasswordResetRequests,
 )
 from warehouse.accounts.models import Email, User
 from warehouse.admin.flags import AdminFlagValue
 from warehouse.cache.origin import origin_cache
 from warehouse.email import (
     send_added_as_collaborator_email,
+    send_added_as_organization_member_email,
     send_collaborator_added_email,
+    send_declined_as_invited_organization_member_email,
     send_email_verification_email,
+    send_organization_member_added_email,
+    send_organization_member_invite_declined_email,
     send_password_change_email,
     send_password_reset_email,
+    send_recovery_code_reminder_email,
 )
+from warehouse.organizations.interfaces import IOrganizationService
+from warehouse.organizations.models import OrganizationRole, OrganizationRoleType
 from warehouse.packaging.models import (
     JournalEntry,
     Project,
@@ -93,6 +104,19 @@ def unverified_emails(exc, request):
         request._(
             "Too many emails have been added to this account without verifying "
             "them. Check your inbox and follow the verification links. (IP: ${ip})",
+            mapping={"ip": request.remote_addr},
+        ),
+        retry_after=exc.resets_in.total_seconds(),
+    )
+
+
+@view_config(context=TooManyPasswordResetRequests, has_translations=True)
+def incomplete_password_resets(exc, request):
+    return HTTPTooManyRequests(
+        request._(
+            "Too many password resets have been requested for this account without "
+            "completing them. Check your inbox and follow the verification links. "
+            "(IP: ${ip})",
             mapping={"ip": request.remote_addr},
         ),
         retry_after=exc.resets_in.total_seconds(),
@@ -242,6 +266,7 @@ def two_factor_and_totp_validate(request, _form_class=TOTPAuthenticationForm):
     if user_service.has_totp(userid):
         two_factor_state["totp_form"] = _form_class(
             request.POST,
+            request=request,
             user_id=userid,
             user_service=user_service,
             check_password_metrics_tags=["method:auth", "auth_method:login_form"],
@@ -254,7 +279,9 @@ def two_factor_and_totp_validate(request, _form_class=TOTPAuthenticationForm):
     if request.method == "POST":
         form = two_factor_state["totp_form"]
         if form.validate():
-            _login_user(request, userid, two_factor_method="totp")
+            _login_user(
+                request, userid, two_factor_method="totp", two_factor_label="totp"
+            )
             user_service.update_user(userid, last_totp_value=form.totp_value.data)
 
             resp = HTTPSeeOther(redirect_to)
@@ -264,6 +291,10 @@ def two_factor_and_totp_validate(request, _form_class=TOTPAuthenticationForm):
                 .hexdigest()
                 .lower(),
             )
+
+            if not two_factor_state.get("has_recovery_codes", False):
+                send_recovery_code_reminder_email(request, request.user)
+
             return resp
         else:
             form.totp_value.data = ""
@@ -325,6 +356,7 @@ def webauthn_authentication_validate(request):
     user_service = request.find_service(IUserService, context=None)
     form = WebAuthnAuthenticationForm(
         **request.POST,
+        request=request,
         user_id=userid,
         user_service=user_service,
         challenge=request.session.get_webauthn_challenge(),
@@ -335,11 +367,17 @@ def webauthn_authentication_validate(request):
     request.session.clear_webauthn_challenge()
 
     if form.validate():
-        credential_id, sign_count = form.validated_credential
-        webauthn = user_service.get_webauthn_by_credential_id(userid, credential_id)
-        webauthn.sign_count = sign_count
+        webauthn = user_service.get_webauthn_by_credential_id(
+            userid, bytes_to_base64url(form.validated_credential.credential_id)
+        )
+        webauthn.sign_count = form.validated_credential.new_sign_count
 
-        _login_user(request, userid, two_factor_method="webauthn")
+        _login_user(
+            request,
+            userid,
+            two_factor_method="webauthn",
+            two_factor_label=webauthn.label,
+        )
 
         request.response.set_cookie(
             USER_ID_INSECURE_COOKIE,
@@ -347,6 +385,10 @@ def webauthn_authentication_validate(request):
             .hexdigest()
             .lower(),
         )
+
+        if not request.user.has_recovery_codes:
+            send_recovery_code_reminder_email(request, request.user)
+
         return {
             "success": request._("Successful WebAuthn assertion"),
             "redirect_to": redirect_to,
@@ -380,7 +422,9 @@ def recovery_code(request, _form_class=RecoveryCodeAuthenticationForm):
 
     user_service = request.find_service(IUserService, context=None)
 
-    form = _form_class(request.POST, user_id=userid, user_service=user_service)
+    form = _form_class(
+        request.POST, request=request, user_id=userid, user_service=user_service
+    )
 
     if request.method == "POST":
         if form.validate():
@@ -397,7 +441,6 @@ def recovery_code(request, _form_class=RecoveryCodeAuthenticationForm):
             user_service.record_event(
                 userid,
                 tag="account:recovery_codes:used",
-                ip_address=request.remote_addr,
             )
 
             request.session.flash(
@@ -506,13 +549,10 @@ def register(request, _form_class=RegistrationForm):
         user = user_service.create_user(
             form.username.data, form.full_name.data, form.new_password.data
         )
-        email = user_service.add_email(
-            user.id, form.email.data, request.remote_addr, primary=True
-        )
+        email = user_service.add_email(user.id, form.email.data, primary=True)
         user_service.record_event(
             user.id,
             tag="account:create",
-            ip_address=request.remote_addr,
             additional={"email": form.email.data},
         )
 
@@ -549,13 +589,18 @@ def request_password_reset(request, _form_class=RequestPasswordResetForm):
                 user.emails, key=lambda e: e.email == form.username_or_email.data
             )
 
+        if not user_service.ratelimiters["password.reset"].test(user.id):
+            raise TooManyPasswordResetRequests(
+                resets_in=user_service.ratelimiters["password.reset"].resets_in(user.id)
+            )
+
         if user.can_reset_password:
             send_password_reset_email(request, (user, email))
             user_service.record_event(
                 user.id,
                 tag="account:password:reset:request",
-                ip_address=request.remote_addr,
             )
+            user_service.ratelimiters["password.reset"].hit(user.id)
 
             token_service = request.find_service(ITokenService, name="password")
             n_hours = token_service.max_age // 60 // 60
@@ -564,7 +609,6 @@ def request_password_reset(request, _form_class=RequestPasswordResetForm):
             user_service.record_event(
                 user.id,
                 tag="account:password:reset:attempt",
-                ip_address=request.remote_addr,
             )
             request.session.flash(
                 request._(
@@ -620,8 +664,12 @@ def reset_password(request, _form_class=ResetPasswordForm):
         return _error(request._("Invalid token: user not found"))
 
     # Check whether the user has logged in since the token was created
-    last_login = data.get("user.last_login")
-    if str(user.last_login) > last_login:
+    last_login = datetime.datetime.fromisoformat(data.get("user.last_login"))
+    # Before updating itsdangerous to 2.x the last_login was naive,
+    # now it's localized to UTC
+    if not last_login.tzinfo:
+        last_login = pytz.UTC.localize(last_login)
+    if user.last_login > last_login:
         # TODO: track and audit this, seems alertable
         return _error(
             request._(
@@ -630,8 +678,17 @@ def reset_password(request, _form_class=ResetPasswordForm):
         )
 
     # Check whether the password has been changed since the token was created
-    password_date = data.get("user.password_date")
-    if str(user.password_date) > password_date:
+    password_date = datetime.datetime.fromisoformat(data.get("user.password_date"))
+    # Before updating itsdangerous to 2.x the password_date was naive,
+    # now it's localized to UTC
+    if not password_date.tzinfo:
+        password_date = pytz.UTC.localize(password_date)
+    current_password_date = (
+        user.password_date
+        if user.password_date is not None
+        else datetime.datetime.min.replace(tzinfo=pytz.UTC)
+    )
+    if current_password_date > password_date:
         return _error(
             request._(
                 "Invalid token: password has already been changed since this "
@@ -649,11 +706,13 @@ def reset_password(request, _form_class=ResetPasswordForm):
     )
 
     if request.method == "POST" and form.validate():
+        password_reset_limiter = request.find_service(
+            IRateLimiter, name="password.reset"
+        )
         # Update password.
         user_service.update_user(user.id, password=form.new_password.data)
-        user_service.record_event(
-            user.id, tag="account:password:reset", ip_address=request.remote_addr
-        )
+        user_service.record_event(user.id, tag="account:password:reset")
+        password_reset_limiter.clear(user.id)
 
         # Send password change email
         send_password_change_email(request, user)
@@ -764,6 +823,174 @@ def _get_two_factor_data(request, _redirect_to="/"):
 
 
 @view_config(
+    route_name="accounts.verify-organization-role",
+    renderer="accounts/organization-invite-confirmation.html",
+    require_methods=False,
+    uses_session=True,
+    permission="manage:user",
+    has_translations=True,
+)
+def verify_organization_role(request):
+    token_service = request.find_service(ITokenService, name="email")
+    organization_service = request.find_service(IOrganizationService, context=None)
+    user_service = request.find_service(IUserService, context=None)
+
+    def _error(message):
+        request.session.flash(message, queue="error")
+        return HTTPSeeOther(request.route_path("manage.organizations"))
+
+    try:
+        token = request.params.get("token")
+        data = token_service.loads(token)
+    except TokenExpired:
+        return _error(request._("Expired token: request a new organization invitation"))
+    except TokenInvalid:
+        return _error(request._("Invalid token: request a new organization invitation"))
+    except TokenMissing:
+        return _error(request._("Invalid token: no token supplied"))
+
+    # Check whether this token is being used correctly
+    if data.get("action") != "email-organization-role-verify":
+        return _error(request._("Invalid token: not an organization invitation token"))
+
+    user = user_service.get_user(data.get("user_id"))
+    if user != request.user:
+        return _error(request._("Organization invitation is not valid."))
+
+    organization = organization_service.get_organization(data.get("organization_id"))
+    desired_role = data.get("desired_role")
+
+    organization_invite = organization_service.get_organization_invite_by_user(
+        organization.id, user.id
+    )
+    if not organization_invite:
+        return _error(request._("Organization invitation no longer exists."))
+
+    # Use the renderer to bring up a confirmation page
+    # before adding as contributor
+    if request.method == "GET":
+        return {
+            "organization_name": organization.name,
+            "desired_role": desired_role,
+        }
+    elif request.method == "POST" and "decline" in request.POST:
+        organization_service.delete_organization_invite(organization_invite.id)
+        submitter_user = user_service.get_user(data.get("submitter_id"))
+        organization.record_event(
+            tag="organization:organization_role:declined",
+            ip_address=request.remote_addr,
+            additional={
+                "submitted_by_user_id": str(submitter_user.id),
+                "role_name": desired_role,
+                "target_user_id": str(user.id),
+            },
+        )
+        user.record_event(
+            tag="account:organization_role:declined",
+            ip_address=request.remote_addr,
+            additional={
+                "submitted_by_user_id": str(submitter_user.id),
+                "organization_name": organization.name,
+                "role_name": desired_role,
+            },
+        )
+        owner_roles = (
+            request.db.query(OrganizationRole)
+            .filter(OrganizationRole.organization == organization)
+            .filter(OrganizationRole.role_name == OrganizationRoleType.Owner)
+            .all()
+        )
+        owner_users = {owner.user for owner in owner_roles}
+        send_organization_member_invite_declined_email(
+            request,
+            owner_users,
+            user=user,
+            organization_name=organization.name,
+        )
+        send_declined_as_invited_organization_member_email(
+            request,
+            user,
+            organization_name=organization.name,
+        )
+        request.session.flash(
+            request._(
+                "Invitation for '${organization_name}' is declined.",
+                mapping={"organization_name": organization.name},
+            ),
+            queue="success",
+        )
+        return HTTPSeeOther(request.route_path("manage.organizations"))
+
+    organization_service.add_organization_role(
+        organization_id=organization.id,
+        user_id=user.id,
+        role_name=desired_role,
+    )
+    organization_service.delete_organization_invite(organization_invite.id)
+    submitter_user = user_service.get_user(data.get("submitter_id"))
+    organization.record_event(
+        tag="organization:organization_role:accepted",
+        ip_address=request.remote_addr,
+        additional={
+            "submitted_by_user_id": str(submitter_user.id),
+            "role_name": desired_role,
+            "target_user_id": str(user.id),
+        },
+    )
+    user.record_event(
+        tag="account:organization_role:accepted",
+        ip_address=request.remote_addr,
+        additional={
+            "submitted_by_user_id": str(submitter_user.id),
+            "organization_name": organization.name,
+            "role_name": desired_role,
+        },
+    )
+
+    owner_roles = (
+        request.db.query(OrganizationRole)
+        .filter(OrganizationRole.organization == organization)
+        .filter(OrganizationRole.role_name == OrganizationRoleType.Owner)
+        .all()
+    )
+    owner_users = {owner.user for owner in owner_roles}
+
+    # Don't send email to new user if they are now an owner
+    owner_users.discard(user)
+
+    send_organization_member_added_email(
+        request,
+        owner_users,
+        user=user,
+        submitter=submitter_user,
+        organization_name=organization.name,
+        role=desired_role,
+    )
+
+    send_added_as_organization_member_email(
+        request,
+        user,
+        submitter=submitter_user,
+        organization_name=organization.name,
+        role=desired_role,
+    )
+
+    request.session.flash(
+        request._(
+            "You are now ${role} of the '${organization_name}' organization.",
+            mapping={"organization_name": organization.name, "role": desired_role},
+        ),
+        queue="success",
+    )
+
+    return HTTPSeeOther(
+        request.route_path(
+            "manage.organization.roles", organization_name=organization.normalized_name
+        )
+    )
+
+
+@view_config(
     route_name="accounts.verify-project-role",
     renderer="accounts/invite-confirmation.html",
     require_methods=False,
@@ -783,9 +1010,9 @@ def verify_project_role(request):
         token = request.params.get("token")
         data = token_service.loads(token)
     except TokenExpired:
-        return _error(request._("Expired token: request a new project role invite"))
+        return _error(request._("Expired token: request a new project role invitation"))
     except TokenInvalid:
-        return _error(request._("Invalid token: request a new project role invite"))
+        return _error(request._("Invalid token: request a new project role invitation"))
     except TokenMissing:
         return _error(request._("Invalid token: no token supplied"))
 
@@ -904,7 +1131,7 @@ def verify_project_role(request):
         return HTTPSeeOther(request.route_path("packaging.project", name=project.name))
 
 
-def _login_user(request, userid, two_factor_method=None):
+def _login_user(request, userid, two_factor_method=None, two_factor_label=None):
     # We have a session factory associated with this request, so in order
     # to protect against session fixation attacks we're going to make sure
     # that we create a new session (which for sessions with an identifier
@@ -946,10 +1173,15 @@ def _login_user(request, userid, two_factor_method=None):
     user_service.record_event(
         userid,
         tag="account:login:success",
-        ip_address=request.remote_addr,
-        additional={"two_factor_method": two_factor_method},
+        additional={
+            "two_factor_method": two_factor_method,
+            "two_factor_label": two_factor_label,
+        },
     )
     request.session.record_auth_timestamp()
+    request.session.record_password_timestamp(
+        user_service.get_password_timestamp(userid)
+    )
     return headers
 
 
@@ -1006,6 +1238,7 @@ def reauthenticate(request, _form_class=ReAuthenticateForm):
         next_route=request.matched_route.name,
         next_route_matchdict=json.dumps(request.matchdict),
         user_service=user_service,
+        action="reauthenticate",
         check_password_metrics_tags=[
             "method:reauth",
             "auth_method:reauthenticate_form",
@@ -1023,5 +1256,8 @@ def reauthenticate(request, _form_class=ReAuthenticateForm):
 
     if request.method == "POST" and form.validate():
         request.session.record_auth_timestamp()
+        request.session.record_password_timestamp(
+            user_service.get_password_timestamp(request.user.id)
+        )
 
     return resp

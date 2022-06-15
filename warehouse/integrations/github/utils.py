@@ -21,12 +21,12 @@ import requests
 from warehouse import integrations
 from warehouse.accounts.interfaces import IUserService
 from warehouse.email import send_token_compromised_email_leak
-from warehouse.macaroons.caveats import InvalidMacaroon
+from warehouse.macaroons.caveats import InvalidMacaroonError
 from warehouse.macaroons.interfaces import IMacaroonService
 from warehouse.metrics import IMetricsService
 
 
-class ExtractionFailed(Exception):
+class ExtractionFailedError(Exception):
     pass
 
 
@@ -63,28 +63,29 @@ TOKEN_LEAK_MATCHERS = {
 }
 
 
-class InvalidTokenLeakRequest(Exception):
+class InvalidTokenLeakRequestError(Exception):
     def __init__(self, message, reason):
         self.reason = reason
         super().__init__(message)
 
 
 class TokenLeakDisclosureRequest:
-    def __init__(self, token: str, public_url: str):
+    def __init__(self, token: str, public_url: str, source: Optional[str] = None):
         self.token = token
         self.public_url = public_url
+        self.source = source
 
     @classmethod
     def from_api_record(cls, record, *, matchers=TOKEN_LEAK_MATCHERS):
 
         if not isinstance(record, dict):
-            raise InvalidTokenLeakRequest(
+            raise InvalidTokenLeakRequestError(
                 f"Record is not a dict but: {str(record)[:100]}", reason="format"
             )
 
         missing_keys = sorted({"token", "type", "url"} - set(record))
         if missing_keys:
-            raise InvalidTokenLeakRequest(
+            raise InvalidTokenLeakRequestError(
                 f"Record is missing attribute(s): {', '.join(missing_keys)}",
                 reason="format",
             )
@@ -93,7 +94,7 @@ class TokenLeakDisclosureRequest:
 
         matcher = matchers.get(matcher_code)
         if not matcher:
-            raise InvalidTokenLeakRequest(
+            raise InvalidTokenLeakRequestError(
                 f"Matcher with code {matcher_code} not found. "
                 f"Available codes are: {', '.join(matchers)}",
                 reason="invalid_matcher",
@@ -101,15 +102,17 @@ class TokenLeakDisclosureRequest:
 
         try:
             extracted_token = matcher.extract(record["token"])
-        except ExtractionFailed:
-            raise InvalidTokenLeakRequest(
+        except ExtractionFailedError:
+            raise InvalidTokenLeakRequestError(
                 "Cannot extract token from recieved match", reason="extraction"
             )
 
-        return cls(token=extracted_token, public_url=record["url"])
+        return cls(
+            token=extracted_token, public_url=record["url"], source=record.get("source")
+        )
 
 
-class GitHubPublicKeyMetaAPIError(InvalidTokenLeakRequest):
+class GitHubPublicKeyMetaAPIError(InvalidTokenLeakRequestError):
     pass
 
 
@@ -220,7 +223,7 @@ def _analyze_disclosure(request, disclosure_record, origin):
         disclosure = TokenLeakDisclosureRequest.from_api_record(
             record=disclosure_record
         )
-    except InvalidTokenLeakRequest as exc:
+    except InvalidTokenLeakRequestError as exc:
         metrics.increment(f"warehouse.token_leak.{origin}.error.{exc.reason}")
         return
 
@@ -229,7 +232,7 @@ def _analyze_disclosure(request, disclosure_record, origin):
         database_macaroon = macaroon_service.find_from_raw(
             raw_macaroon=disclosure.token
         )
-    except InvalidMacaroon:
+    except InvalidMacaroonError:
         metrics.increment(f"warehouse.token_leak.{origin}.error.invalid")
         return
 
@@ -248,11 +251,12 @@ def _analyze_disclosure(request, disclosure_record, origin):
     user_service.record_event(
         database_macaroon.user.id,
         tag="account:api_token:removed_leak",
-        ip_address="127.0.0.1",
         additional={
             "macaroon_id": str(database_macaroon.id),
             "public_url": disclosure.public_url,
-            "permissions": database_macaroon.caveats.get("permissions", "user"),
+            "permissions": database_macaroon.permissions_caveat.get(
+                "permissions", "user"
+            ),
             "description": database_macaroon.description,
         },
     )
@@ -277,7 +281,9 @@ def analyze_disclosures(request, disclosure_records, origin, metrics):
 
     if not isinstance(disclosure_records, list):
         metrics.increment(f"warehouse.token_leak.{origin}.error.format")
-        raise InvalidTokenLeakRequest("Invalid format: payload is not a list", "format")
+        raise InvalidTokenLeakRequestError(
+            "Invalid format: payload is not a list", "format"
+        )
 
     for disclosure_record in disclosure_records:
         request.task(tasks.analyze_disclosure_task).delay(

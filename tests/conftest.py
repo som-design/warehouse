@@ -12,6 +12,7 @@
 
 import os
 import os.path
+import re
 import xmlrpc.client
 
 from collections import defaultdict
@@ -25,18 +26,31 @@ import pyramid.testing
 import pytest
 import webtest as _webtest
 
+from jinja2 import Environment, FileSystemLoader
+from psycopg2.errors import InvalidCatalogName
 from pyramid.i18n import TranslationString
 from pyramid.static import ManifestCacheBuster
+from pyramid_jinja2 import IJinja2Environment
+from pyramid_mailer.mailer import DummyMailer
 from pytest_postgresql.config import get_config
 from pytest_postgresql.janitor import DatabaseJanitor
 from sqlalchemy import event
 
-from warehouse import admin, config, static
+import warehouse
+
+from warehouse import admin, config, email, static
 from warehouse.accounts import services as account_services
+from warehouse.accounts.interfaces import ITokenService, IUserService
+from warehouse.admin.flags import AdminFlag, AdminFlagValue
+from warehouse.email import services as email_services
+from warehouse.email.interfaces import IEmailSender
 from warehouse.macaroons import services as macaroon_services
 from warehouse.metrics import IMetricsService
+from warehouse.organizations import services as organization_services
+from warehouse.organizations.interfaces import IOrganizationService
 
 from .common.db import Session
+from .common.db.accounts import EmailFactory, UserFactory
 
 
 def pytest_collection_modifyitems(items):
@@ -75,6 +89,27 @@ def metrics():
     )
 
 
+@pytest.fixture
+def remote_addr():
+    return "1.2.3.4"
+
+
+@pytest.fixture
+def jinja():
+    dir_name = os.path.join(os.path.dirname(warehouse.__file__))
+
+    env = Environment(
+        loader=FileSystemLoader(dir_name),
+        extensions=[
+            "jinja2.ext.i18n",
+            "warehouse.utils.html.ClientSideIncludeExtension",
+        ],
+        cache_size=0,
+    )
+
+    return env
+
+
 class _Services:
     def __init__(self):
         self._services = defaultdict(lambda: defaultdict(dict))
@@ -87,20 +122,31 @@ class _Services:
 
 
 @pytest.fixture
-def pyramid_services(metrics):
+def pyramid_services(
+    email_service, metrics, organization_service, token_service, user_service
+):
     services = _Services()
 
     # Register our global services.
+    services.register_service(email_service, IEmailSender, None, name="")
     services.register_service(metrics, IMetricsService, None, name="")
+    services.register_service(organization_service, IOrganizationService, None, name="")
+    services.register_service(token_service, ITokenService, None, name="password")
+    services.register_service(token_service, ITokenService, None, name="email")
+    services.register_service(user_service, IUserService, None, name="")
 
     return services
 
 
 @pytest.fixture
-def pyramid_request(pyramid_services):
+def pyramid_request(pyramid_services, jinja, remote_addr):
+    pyramid.testing.setUp()
     dummy_request = pyramid.testing.DummyRequest()
     dummy_request.find_service = pyramid_services.find_service
-    dummy_request.remote_addr = "1.2.3.4"
+    dummy_request.remote_addr = remote_addr
+    dummy_request.authentication_method = pretend.stub()
+
+    dummy_request.registry.registerUtility(jinja, IJinja2Environment, name=".jinja2")
 
     def localize(message, **kwargs):
         ts = TranslationString(message, **kwargs)
@@ -108,16 +154,26 @@ def pyramid_request(pyramid_services):
 
     dummy_request._ = localize
 
-    return dummy_request
+    yield dummy_request
+
+    pyramid.testing.tearDown()
 
 
-@pytest.yield_fixture
+@pytest.fixture
 def pyramid_config(pyramid_request):
     with pyramid.testing.testConfig(request=pyramid_request) as config:
         yield config
 
 
-@pytest.yield_fixture
+@pytest.fixture
+def pyramid_user(pyramid_request):
+    user = UserFactory.create()
+    EmailFactory.create(user=user, verified=True)
+    pyramid_request.user = user
+    return user
+
+
+@pytest.fixture
 def cli():
     runner = click.testing.CliRunner()
     with runner.isolated_filesystem():
@@ -137,7 +193,12 @@ def database(request):
 
     # In case the database already exists, possibly due to an aborted test run,
     # attempt to drop it before creating
-    janitor.drop()
+    try:
+        janitor.drop()
+    except InvalidCatalogName:
+        # We can safely ignore this exception as that means there was
+        # no leftover database
+        pass
 
     # Create our Database.
     janitor.init()
@@ -178,7 +239,8 @@ def app_config(database):
         "ratelimit.url": "memory://",
         "elasticsearch.url": "https://localhost/warehouse",
         "files.backend": "warehouse.packaging.services.LocalFileStorage",
-        "docs.backend": "warehouse.packaging.services.LocalFileStorage",
+        "simple.backend": "warehouse.packaging.services.LocalSimpleStorage",
+        "docs.backend": "warehouse.packaging.services.LocalDocsStorage",
         "sponsorlogos.backend": "warehouse.admin.services.LocalSponsorLogoStorage",
         "mail.backend": "warehouse.email.services.SMTPEmailSender",
         "malware_check.backend": (
@@ -201,7 +263,7 @@ def app_config(database):
     return cfg
 
 
-@pytest.yield_fixture
+@pytest.fixture
 def db_session(app_config):
     engine = app_config.registry["sqlalchemy.engine"]
     conn = engine.connect()
@@ -227,19 +289,35 @@ def db_session(app_config):
         engine.dispose()
 
 
-@pytest.yield_fixture
-def user_service(db_session, metrics):
-    return account_services.DatabaseUserService(db_session, metrics=metrics)
+@pytest.fixture
+def user_service(db_session, metrics, remote_addr):
+    return account_services.DatabaseUserService(
+        db_session, metrics=metrics, remote_addr=remote_addr
+    )
 
 
-@pytest.yield_fixture
+@pytest.fixture
 def macaroon_service(db_session):
     return macaroon_services.DatabaseMacaroonService(db_session)
 
 
-@pytest.yield_fixture
+@pytest.fixture
+def organization_service(db_session, remote_addr):
+    return organization_services.DatabaseOrganizationService(
+        db_session, remote_addr=remote_addr
+    )
+
+
+@pytest.fixture
 def token_service(app_config):
     return account_services.TokenService(secret="secret", salt="salt", max_age=21600)
+
+
+@pytest.fixture
+def email_service():
+    return email_services.SMTPEmailSender(
+        mailer=DummyMailer(), sender="noreply@pypi.dev"
+    )
 
 
 class QueryRecorder:
@@ -267,7 +345,7 @@ class QueryRecorder:
         self.queries = []
 
 
-@pytest.yield_fixture
+@pytest.fixture
 def query_recorder(app_config):
     recorder = QueryRecorder()
 
@@ -287,6 +365,50 @@ def db_request(pyramid_request, db_session):
     return pyramid_request
 
 
+@pytest.fixture
+def enable_organizations(db_request):
+    flag = db_request.db.query(AdminFlag).get(
+        AdminFlagValue.DISABLE_ORGANIZATIONS.value
+    )
+    flag.enabled = False
+    yield
+    flag.enabled = True
+
+
+@pytest.fixture
+def send_email(pyramid_request, monkeypatch):
+    send_email_stub = pretend.stub(
+        delay=pretend.call_recorder(lambda *args, **kwargs: None)
+    )
+    pyramid_request.task = pretend.call_recorder(
+        lambda *args, **kwargs: send_email_stub
+    )
+    pyramid_request.registry.settings = {"mail.sender": "noreply@example.com"}
+    monkeypatch.setattr(email, "send_email", send_email_stub)
+    return send_email_stub
+
+
+@pytest.fixture
+def make_email_renderers(pyramid_config):
+    def _make_email_renderers(
+        name,
+        subject="Email Subject",
+        body="Email Body",
+        html="Email HTML Body",
+    ):
+        subject_renderer = pyramid_config.testing_add_renderer(
+            f"email/{name}/subject.txt"
+        )
+        subject_renderer.string_response = subject
+        body_renderer = pyramid_config.testing_add_renderer(f"email/{name}/body.txt")
+        body_renderer.string_response = body
+        html_renderer = pyramid_config.testing_add_renderer(f"email/{name}/body.html")
+        html_renderer.string_response = html
+        return subject_renderer, body_renderer, html_renderer
+
+    return _make_email_renderers
+
+
 class _TestApp(_webtest.TestApp):
     def xmlrpc(self, path, method, *args):
         body = xmlrpc.client.dumps(args, methodname=method)
@@ -294,7 +416,7 @@ class _TestApp(_webtest.TestApp):
         return xmlrpc.client.loads(resp.body)
 
 
-@pytest.yield_fixture
+@pytest.fixture
 def webtest(app_config):
     # TODO: Ensure that we have per test isolation of the database level
     #       changes. This probably involves flushing the database or something
@@ -339,3 +461,71 @@ def monkeypatch_session():
     m = MonkeyPatch()
     yield m
     m.undo()
+
+
+class _MockRedis:
+    """
+    Just enough Redis for our tests.
+    In-memory only, no persistence.
+    Does NOT implement the full Redis API.
+    """
+
+    def __init__(self, cache=None):
+        self.cache = cache
+
+        if not self.cache:
+            self.cache = dict()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        pass
+
+    def delete(self, key):
+        del self.cache[key]
+
+    def execute(self):
+        pass
+
+    def exists(self, key):
+        return key in self.cache
+
+    def expire(self, _key, _seconds):
+        pass
+
+    def from_url(self, _url):
+        return self
+
+    def hget(self, hash_, key):
+        try:
+            return self.cache[hash_][key]
+        except KeyError:
+            return None
+
+    def hset(self, hash_, key, value, *_args, **_kwargs):
+        if hash_ not in self.cache:
+            self.cache[hash_] = dict()
+        self.cache[hash_][key] = value
+
+    def get(self, key):
+        return self.cache.get(key)
+
+    def pipeline(self):
+        return self
+
+    def scan_iter(self, search, count):
+        del count  # unused
+        return [key for key in self.cache.keys() if re.search(search, key)]
+
+    def set(self, key, value):
+        self.cache[key] = value
+
+    def setex(self, key, value, _seconds):
+        self.cache[key] = value
+
+
+@pytest.fixture
+def mockredis():
+    mock_redis = _MockRedis()
+    yield mock_redis
