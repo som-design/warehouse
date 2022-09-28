@@ -593,12 +593,12 @@ msgstr ""
 #: warehouse/templates/pages/help.html:844
 #: warehouse/templates/pages/help.html:852
 #: warehouse/templates/pages/help.html:861
-#: warehouse/templates/pages/help.html:881
+#: warehouse/templates/pages/help.html:880
+#: warehouse/templates/pages/help.html:895
 #: warehouse/templates/pages/help.html:896
 #: warehouse/templates/pages/help.html:897
 #: warehouse/templates/pages/help.html:898
-#: warehouse/templates/pages/help.html:899
-#: warehouse/templates/pages/help.html:904
+#: warehouse/templates/pages/help.html:903
 #: warehouse/templates/pages/sponsors.html:33
 #: warehouse/templates/pages/sponsors.html:37
 #: warehouse/templates/pages/sponsors.html:41
@@ -7115,12 +7115,7 @@ msgid ""
 "href=\"%(href)s\">%(href)s</a>."
 msgstr ""
 
-#: warehouse/templates/pages/help.html:873
-#: warehouse/templates/pages/help.html:877
-msgid "Currently, no features are in beta."
-msgstr ""
-
-#: warehouse/templates/pages/help.html:876
+#: warehouse/templates/pages/help.html:875
 msgid ""
 "When Warehouse's maintainers are deploying new features, at first we mark"
 " them with a small \"beta feature\" symbol to tell you: this should "
@@ -7128,7 +7123,11 @@ msgid ""
 "functionality."
 msgstr ""
 
-#: warehouse/templates/pages/help.html:881
+#: warehouse/templates/pages/help.html:876
+msgid "Currently, no features are in beta."
+msgstr ""
+
+#: warehouse/templates/pages/help.html:880
 #, python-format
 msgid ""
 "\"PyPI\" should be pronounced like \"pie pea eye\", specifically with the"
@@ -7138,39 +7137,39 @@ msgid ""
 "implementation of the Python language."
 msgstr ""
 
-#: warehouse/templates/pages/help.html:893
+#: warehouse/templates/pages/help.html:892
 msgid "Resources"
 msgstr ""
 
-#: warehouse/templates/pages/help.html:894
+#: warehouse/templates/pages/help.html:893
 msgid "Looking for something else? Perhaps these links will help:"
 msgstr ""
 
-#: warehouse/templates/pages/help.html:896
+#: warehouse/templates/pages/help.html:895
 msgid "Python Packaging User Guide"
 msgstr ""
 
-#: warehouse/templates/pages/help.html:897
+#: warehouse/templates/pages/help.html:896
 msgid "Python documentation"
 msgstr ""
 
-#: warehouse/templates/pages/help.html:898
+#: warehouse/templates/pages/help.html:897
 msgid "(main Python website)"
 msgstr ""
 
-#: warehouse/templates/pages/help.html:899
+#: warehouse/templates/pages/help.html:898
 msgid "Python community page"
 msgstr ""
 
-#: warehouse/templates/pages/help.html:899
+#: warehouse/templates/pages/help.html:898
 msgid "(lists IRC channels, mailing lists, etc.)"
 msgstr ""
 
-#: warehouse/templates/pages/help.html:902
+#: warehouse/templates/pages/help.html:901
 msgid "Contact"
 msgstr ""
 
-#: warehouse/templates/pages/help.html:904
+#: warehouse/templates/pages/help.html:903
 #, python-format
 msgid ""
 "The <a href=\"%(pypa_href)s\" title=\"%(title)s\" target=\"_blank\" "
