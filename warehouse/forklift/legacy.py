@@ -1185,8 +1185,31 @@ def file_upload(request):
     # The project may or may not have a file size specified on the project, if
     # it does then it may or may not be smaller or larger than our global file
     # size limits.
-    file_size_limit = max(filter(None, [MAX_FILESIZE, project.upload_limit]))
+    file_size_limit = max(
+        filter(
+            None,
+            [MAX_FILESIZE, project.upload_limit]
+            + [r.user.upload_limit for r in project.roles],
+        )
+    )
     project_size_limit = max(filter(None, [MAX_PROJECT_SIZE, project.total_size_limit]))
+    limit_owner, owner_total_size_limit = max(
+        [(None, 0)]
+        + [
+            (r.user, r.user.total_size_limit)
+            for r in project.roles
+            if r.role_name == "Owner" and r.user.total_size_limit is not None
+        ],
+        key=lambda x: x[1],
+    )
+    owner_total_size = 0
+    if limit_owner is not None:
+        owner_total_size = (
+            request.db.query(func.sum(Project.total_size))
+            .join(Role.project)
+            .filter(Role.role_name == "Owner", Role.user == limit_owner)
+            .scalar()
+        )
 
     file_data = None
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -1214,16 +1237,29 @@ def file_upload(request):
                         + request.help_url(_anchor="file-size-limit")
                         + " for more information.",
                     )
-                if file_size + project.total_size > project_size_limit:
-                    raise _exc_with_message(
-                        HTTPBadRequest,
-                        "Project size too large. Limit for "
-                        + "project {name!r} total size is {limit} GB. ".format(
-                            name=project.name, limit=project_size_limit // ONE_GB
+                if limit_owner is None:
+                    if file_size + project.total_size > project_size_limit:
+                        raise _exc_with_message(
+                            HTTPBadRequest,
+                            "Project size too large. Limit for "
+                            + "project {name!r} total size is {limit} GB. ".format(
+                                name=project.name, limit=project_size_limit // ONE_GB
+                            )
+                            + "See "
+                            + request.help_url(_anchor="project-size-limit"),
                         )
-                        + "See "
-                        + request.help_url(_anchor="project-size-limit"),
-                    )
+                else:
+                    if file_size + owner_total_size > owner_total_size_limit:
+                        raise _exc_with_message(
+                            HTTPBadRequest,
+                            "Account total project size too large. Limit for "
+                            + "User {name!r} total size is {limit} GB. ".format(
+                                name=limit_owner.username,
+                                limit=owner_total_size_limit // ONE_GB,
+                            )
+                            + "See "
+                            + request.help_url(_anchor="project-size-limit"),
+                        )
                 fp.write(chunk)
                 for hasher in file_hashes.values():
                     hasher.update(chunk)

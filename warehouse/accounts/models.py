@@ -16,6 +16,7 @@ import enum
 from citext import CIText
 from pyramid.authorization import Allow
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     Column,
@@ -92,6 +93,9 @@ class User(SitemapMixin, HasEvents, db.Model):
         Enum(DisableReason, values_callable=lambda x: [e.value for e in x]),
         nullable=True,
     )
+
+    upload_limit = Column(Integer, nullable=True)
+    total_size_limit = Column(BigInteger, nullable=True)
 
     totp_secret = Column(LargeBinary(length=20), nullable=True)
     last_totp_value = Column(String, nullable=True)

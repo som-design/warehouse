@@ -83,6 +83,8 @@ _TAR_BZ2_PKG_STORAGE_HASH = hashlib.blake2b(
     _TAR_BZ2_PKG_TESTDATA, digest_size=256 // 8
 ).hexdigest()
 
+ONE_MEGABYTE = 1 * 1024 * 1024
+
 
 class TestExcWithMessage:
     def test_exc_with_message(self):
@@ -2051,21 +2053,47 @@ class TestFileUpload:
             "See /the/help/url/"
         )
 
-    def test_upload_fails_with_too_large_project_size_custom_limit(
-        self, pyramid_config, db_request
+    @pytest.mark.parametrize(
+        "project_total_size_limit, owner_total_size_limit, message",
+        [
+            (
+                legacy.MAX_PROJECT_SIZE + ONE_MEGABYTE,
+                None,
+                (
+                    "400 Project size too large. Limit for project 'foobar' total size "
+                    "is 10 GB. See /the/help/url/"
+                ),
+            ),
+            (
+                None,
+                legacy.MAX_PROJECT_SIZE + ONE_MEGABYTE,
+                (
+                    "400 Account total project size too large. Limit for User "
+                    "'ExampleUser' total size is 10 GB. See /the/help/url/"
+                ),
+            ),
+        ],
+    )
+    def test_upload_fails_with_too_large_total_size_custom_limit(
+        self,
+        project_total_size_limit,
+        owner_total_size_limit,
+        message,
+        pyramid_config,
+        db_request,
     ):
 
-        user = UserFactory.create()
+        user = UserFactory.create(
+            username="ExampleUser", total_size_limit=owner_total_size_limit
+        )
         pyramid_config.testing_securitypolicy(identity=user)
         db_request.user = user
         EmailFactory.create(user=user)
-        one_megabyte = 1 * 1024 * 1024
         project = ProjectFactory.create(
             name="foobar",
             upload_limit=legacy.MAX_FILESIZE,
             total_size=legacy.MAX_PROJECT_SIZE,
-            total_size_limit=legacy.MAX_PROJECT_SIZE
-            + one_megabyte,  # Custom Limit for the project
+            total_size_limit=project_total_size_limit,
         )
         release = ReleaseFactory.create(project=project, version="1.0")
         RoleFactory.create(user=user, project=project)
@@ -2081,7 +2109,7 @@ class TestFileUpload:
                 "md5_digest": "nope!",
                 "content": pretend.stub(
                     filename=filename,
-                    file=io.BytesIO(b"a" * (one_megabyte + 1)),
+                    file=io.BytesIO(b"a" * (ONE_MEGABYTE + 1)),
                     type="application/tar",
                 ),
             }
@@ -2095,27 +2123,33 @@ class TestFileUpload:
 
         assert db_request.help_url.calls == [pretend.call(_anchor="project-size-limit")]
         assert resp.status_code == 400
-        assert resp.status == (
-            "400 Project size too large."
-            + " Limit for project 'foobar' total size is 10 GB. "
-            "See /the/help/url/"
-        )
+        assert resp.status == message
 
-    def test_upload_succeeds_custom_project_size_limit(
-        self, pyramid_config, db_request, metrics
+    @pytest.mark.parametrize(
+        "project_total_size_limit, owner_total_size_limit",
+        [
+            (legacy.MAX_PROJECT_SIZE + (ONE_MEGABYTE * 60), None),
+            (None, legacy.MAX_PROJECT_SIZE + (ONE_MEGABYTE * 60)),
+        ],
+    )
+    def test_upload_succeeds_custom_total_size_limits(
+        self,
+        project_total_size_limit,
+        owner_total_size_limit,
+        pyramid_config,
+        db_request,
+        metrics,
     ):
 
-        user = UserFactory.create()
+        user = UserFactory.create(total_size_limit=owner_total_size_limit)
         pyramid_config.testing_securitypolicy(identity=user)
         db_request.user = user
         EmailFactory.create(user=user)
-        one_megabyte = 1 * 1024 * 1024
         project = ProjectFactory.create(
             name="foobar",
             upload_limit=legacy.MAX_FILESIZE,
             total_size=legacy.MAX_PROJECT_SIZE,
-            total_size_limit=legacy.MAX_PROJECT_SIZE
-            + (one_megabyte * 60),  # Custom Limit for the project
+            total_size_limit=project_total_size_limit,
         )
         release = ReleaseFactory.create(project=project, version="1.0")
         RoleFactory.create(user=user, project=project)
